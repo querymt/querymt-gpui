@@ -850,13 +850,7 @@ fn target_label(rt: &AgentRuntime, s: &Schedule) -> String {
         session
             .and_then(|x| x.remote.as_ref())
             .map(|r| r.name())
-            .or_else(|| {
-                rt.mesh_nodes
-                    .iter()
-                    .find(|m| m.id == n && !m.label.is_empty())
-                    .map(|m| m.label.clone())
-            })
-            .unwrap_or_else(|| super::mesh::short_peer(n))
+            .unwrap_or_else(|| rt.peer_name(n))
     });
     let mut parts: Vec<String> = peer.into_iter().collect();
     match session {

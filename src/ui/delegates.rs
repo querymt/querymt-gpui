@@ -377,6 +377,7 @@ impl QmtApp {
     ) -> Div {
         let store = self.store.read(cx);
         let models = store.models(owner).to_vec();
+        let rt = store.runtime(owner);
         let busy = state.pending.is_some() || state.loading;
         let mut out = v_flex().gap_3();
         if state.conflict {
@@ -504,10 +505,15 @@ impl QmtApp {
                         .as_ref()
                         .and_then(|r| models.iter().find(|m| m.key() == r.key()));
                     let unavailable = a.route.is_some() && model.is_none();
-                    // The peer's name from the catalog, else the route's node id.
-                    let peer = model
-                        .and_then(|m| m.node.clone())
-                        .or_else(|| a.route.as_ref().and_then(|r| r.node_id.clone()));
+                    // The peer's name from the catalog, else the mesh's.
+                    let peer =
+                        model.and_then(|m| m.node.clone()).or_else(|| {
+                            let node = a.route.as_ref()?.node_id.as_deref()?;
+                            Some(rt.map_or_else(
+                                || crate::util::short_peer(node),
+                                |rt| rt.peer_name(node),
+                            ))
+                        });
                     kit::card_row(ix == 0, p)
                         .id(kit::keyed("delegate-row", a.agent_id.clone()))
                         .when(enabled, |el| {
@@ -687,6 +693,17 @@ impl QmtApp {
             .as_ref()
             .filter(|r| !store.models(owner).iter().any(|m| m.key() == r.key()))
             .cloned();
+        // " on <peer>" of the unavailable route.
+        let unavailable_on = unavailable
+            .as_ref()
+            .and_then(|r| r.node_id.as_deref())
+            .map(|node| {
+                let name = store
+                    .runtime(owner)
+                    .map_or_else(|| crate::util::short_peer(node), |rt| rt.peer_name(node));
+                format!(" on {name}")
+            })
+            .unwrap_or_default();
         let busy = state.pending.is_some() || !routes.editable;
         let rows = self.model_rows(cx);
         let search = self.model_search(owner, p, cx);
@@ -759,7 +776,7 @@ impl QmtApp {
                     &format!(
                         "The current route {}{} is unavailable. It is kept until you replace or reset it.",
                         r.model_id,
-                        r.node_id.as_deref().map(|n| format!(" on {n}")).unwrap_or_default()
+                        unavailable_on
                     ),
                     p,
                 )

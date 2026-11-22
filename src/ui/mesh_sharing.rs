@@ -378,11 +378,7 @@ impl QmtApp {
             .map(|(id, online)| {
                 let node = rt.mesh_nodes.iter().find(|n| n.id == id);
                 PeerView {
-                    name: node
-                        .map(|n| n.label.clone())
-                        .filter(|l| !l.is_empty())
-                        .or_else(|| rt.peer_labels.get(&id).cloned())
-                        .unwrap_or_else(|| short_peer(&id)),
+                    name: rt.peer_name(&id),
                     active_sessions: node.map_or(0, |n| n.active_sessions),
                     sharing: rt.sharing.get(&id).cloned().unwrap_or_default(),
                     online,

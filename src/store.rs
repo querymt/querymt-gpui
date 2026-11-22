@@ -154,7 +154,8 @@ pub struct Model {
     pub model: String,
     /// Mesh node serving the model (`node_id`); `None`: the agent's own.
     pub node_id: Option<String>,
-    /// Display name of that node (`node_label`, else its id).
+    /// Display name of that node: `node_label`, else the mesh node's label,
+    /// else its short ID (`util::short_peer`).
     pub node: Option<String>,
     /// Context window in tokens (`_querymt/modelInfo`), when known.
     pub context: Option<u64>,
@@ -279,7 +280,7 @@ impl RemoteOwner {
         self.label
             .clone()
             .filter(|l| !l.trim().is_empty())
-            .unwrap_or_else(|| self.node_id.chars().take(8).collect())
+            .unwrap_or_else(|| crate::util::short_peer(&self.node_id))
     }
 }
 
@@ -1268,6 +1269,47 @@ pub struct ChildList {
 }
 
 impl AgentRuntime {
+    /// How a mesh peer is shown: its node label when known (now or earlier
+    /// in this app run), else its short ID. The one place peer names are made.
+    pub fn peer_name(&self, id: &str) -> String {
+        self.mesh_nodes
+            .iter()
+            .find(|n| n.id == id && !n.label.trim().is_empty())
+            .map(|n| n.label.clone())
+            .or_else(|| self.peer_labels.get(id).cloned())
+            .unwrap_or_else(|| crate::util::short_peer(id))
+    }
+
+    /// Models served by a mesh node without a `node_label` take the node's
+    /// name from the mesh list.
+    fn name_model_nodes(&mut self) {
+        let names: Vec<Option<String>> = self
+            .models
+            .iter()
+            .map(|m| {
+                let labelled = m
+                    .raw
+                    .get("node_label")
+                    .and_then(Value::as_str)
+                    .is_some_and(|l| !l.trim().is_empty());
+                m.node_id
+                    .as_deref()
+                    .filter(|_| !labelled)
+                    .map(|id| self.peer_name(id))
+            })
+            .collect();
+        for (m, name) in self.models.iter_mut().zip(names) {
+            if let Some(name) = name {
+                m.node = Some(name);
+            }
+        }
+    }
+
+    fn set_models(&mut self, models: Vec<Model>) {
+        self.models = models;
+        self.name_model_nodes();
+    }
+
     /// Every loaded copy of a session: the catalog row and nested child rows.
     fn sessions_mut<'a>(
         &'a mut self,
@@ -2368,7 +2410,7 @@ impl AgentsStore {
             let models = hydrate_model_info(&rpc, models).await;
             let _ = this.update(cx, |s, cx| {
                 if let Some(rt) = s.live(&id, generation) {
-                    rt.models = models;
+                    rt.set_models(models);
                     rt.pending.remove("models");
                 }
                 cx.notify();
@@ -2836,9 +2878,7 @@ impl AgentsStore {
         self.launch.busy = true;
         self.launch.error = None;
         self.launch.last_started = None;
-        self.launch.creating_on = remote
-            .as_ref()
-            .map(|r| r.label.clone().unwrap_or_else(|| r.node_id.clone()));
+        self.launch.creating_on = remote.as_ref().map(RemoteOwner::name);
         self.session = None;
         self.set_cwd(cwd.clone());
         cx.notify();
@@ -3988,12 +4028,13 @@ impl AgentsStore {
             .map(RemoteOwner::name)
             .or_else(|| {
                 let node = model_node?;
-                let label = self.runtime.get(agent_id)?.models.iter().find_map(|m| {
+                let rt = self.runtime.get(agent_id)?;
+                let label = rt.models.iter().find_map(|m| {
                     (m.node_id.as_deref() == Some(node.as_str()))
                         .then(|| m.node.clone())
                         .flatten()
                 });
-                Some(label.unwrap_or(node))
+                Some(label.unwrap_or_else(|| rt.peer_name(&node)))
             });
         if let Some(view) = self
             .session
@@ -4880,7 +4921,7 @@ async fn load_details(
     apply!(|rt: &mut AgentRuntime| {
         rt.models_loaded = true;
         match (&models, parsed.clone()) {
-            (_, Some(models)) => rt.models = models,
+            (_, Some(models)) => rt.set_models(models),
             (Err(err), None) => rt.log_warn(format!("Models unavailable: {err}")),
             _ => {}
         }
@@ -4891,7 +4932,7 @@ async fn load_details(
         let models = hydrate_model_info(&rpc, models)
             .instrument(tracing::info_span!("agent.model_info"))
             .await;
-        apply!(|rt: &mut AgentRuntime| rt.models = models);
+        apply!(|rt: &mut AgentRuntime| rt.set_models(models));
     }
 
     // The whole catalog, so lifecycle tab counts and search cover every session.
@@ -5031,7 +5072,9 @@ fn parse_models(v: &Value) -> Vec<Model> {
                 label: s("label").unwrap_or_else(|| model.clone()),
                 provider: s("provider").unwrap_or_default(),
                 model,
-                node: s("node_label").or_else(|| s("node_id")),
+                node: s("node_label")
+                    .filter(|l| !l.trim().is_empty())
+                    .or_else(|| s("node_id").map(|n| crate::util::short_peer(&n))),
                 node_id: s("node_id"),
                 context: None,
                 modalities: Vec::new(),
@@ -5339,6 +5382,7 @@ async fn load_extras(
                     for n in rt.mesh_nodes.iter().filter(|n| !n.label.is_empty()) {
                         rt.peer_labels.insert(n.id.clone(), n.label.clone());
                     }
+                    rt.name_model_nodes();
                     rt.managed_peers = mesh_access::managed_peers(&v);
                 }
                 if let Ok(v) = invites {
@@ -5390,6 +5434,37 @@ async fn load_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_models_name_their_node_like_the_mesh_page() {
+        const THOR: &str = "12D3KooWLCvKmZTEpPiXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW";
+        let mut rt = AgentRuntime::default();
+        // No `node_label` (as an older peer sends): never the raw ID.
+        rt.set_models(parse_models(&json!({ "models": [
+            { "id": "codex/gpt-6.2-sol", "provider": "codex", "node_id": THOR },
+            { "id": "codex/gpt-6.2-astra", "provider": "codex", "node_id": "n2", "node_label": "odin" },
+        ] })));
+        assert_eq!(rt.models[0].node.as_deref(), Some("12D3KooWLCvK…pKp3jXLW"));
+        // The mesh list knows its name: used once it arrives.
+        rt.mesh_nodes = vec![MeshNode {
+            id: THOR.into(),
+            label: "thor".into(),
+            active_sessions: 0,
+            capabilities: Vec::new(),
+            transport: String::new(),
+        }];
+        rt.name_model_nodes();
+        assert_eq!(rt.models[0].node.as_deref(), Some("thor"));
+        assert_eq!(
+            rt.models[1].node.as_deref(),
+            Some("odin"),
+            "the catalog's label wins"
+        );
+        assert_eq!(
+            rt.peer_name("12D3KooWPtRjAbCdEfGhIjKlunWZUT62"),
+            "12D3KooWPtRj…unWZUT62"
+        );
+    }
 
     #[gpui_kit::test]
     fn a_used_up_mesh_limit_explains_itself(cx: &mut gpui_kit::TestAppContext) {
@@ -5464,7 +5539,7 @@ mod tests {
             "_meta": {
                 "parentSessionId": "p1", "forkOrigin": "user", "forkCount": 2, "hasChildren": true,
                 "messageCount": 5, "hasErrors": true,
-                "location": "remote", "nodeId": "node-123456789", "nodeLabel": "", "connectionState": "disconnected",
+                "location": "remote", "nodeId": "12D3KooWLCvKmZTEpPiXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW", "nodeLabel": "", "connectionState": "disconnected",
                 "runtimeStatus": { "phase": "idle", "observation": { "availability": "unavailable" } },
                 "querymt": {
                     "lifecycle": { "session_id": "s1", "resolved": true, "archived": false },
@@ -5483,7 +5558,8 @@ mod tests {
         assert!(!s.worktree.as_ref().unwrap().usable());
         let remote = s.remote.unwrap();
         assert!(!remote.connected);
-        assert_eq!(remote.name(), "node-123");
+        // No label: the short peer ID, as everywhere.
+        assert_eq!(remote.name(), "12D3KooWLCvK…pKp3jXLW");
 
         let bare = SessionSummary::from_list_entry("a", &json!({ "sessionId": "s2", "cwd": "/w" }));
         assert!(bare.root && !bare.lifecycle_known && bare.status_unknown());

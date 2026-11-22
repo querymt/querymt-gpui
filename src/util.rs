@@ -107,6 +107,18 @@ fn parse_zone_tab(tab: &str) -> Vec<String> {
         .collect()
 }
 
+/// A mesh peer ID shortened for display, the same everywhere: the first 12
+/// and last 8 characters, `12D3KooWPtRj…unWZUT62`.
+pub fn short_peer(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 21 {
+        return id.to_string();
+    }
+    let head: String = chars[..12].iter().collect();
+    let tail: String = chars[chars.len() - 8..].iter().collect();
+    format!("{head}…{tail}")
+}
+
 pub fn workspace_name(cwd: &str) -> String {
     cwd.trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
@@ -252,9 +264,19 @@ pub fn split_front_matter(text: &str) -> Option<(FrontMatter, &str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_rfc3339, fuzzy_score, parse_rfc3339_ms, parse_zone_tab, split_front_matter,
-        time_zones,
+        format_rfc3339, fuzzy_score, parse_rfc3339_ms, parse_zone_tab, short_peer,
+        split_front_matter, time_zones,
     };
+
+    #[test]
+    fn peer_ids_shorten_to_12_and_8_around_an_ellipsis() {
+        assert_eq!(
+            short_peer("12D3KooWLCvKmZTEpPiXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW"),
+            "12D3KooWLCvK…pKp3jXLW"
+        );
+        // Nothing to gain from shortening a short id.
+        assert_eq!(short_peer("thor-id"), "thor-id");
+    }
 
     #[test]
     fn zone_tab_lists_the_zone_column() {
