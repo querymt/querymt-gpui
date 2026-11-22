@@ -3975,10 +3975,26 @@ impl AgentsStore {
             .err()
             .and_then(|e| e.raw())
             .and_then(mesh_access::quota_exhausted);
+        // The machine that refused: the session's owner, else the node
+        // serving the session's model.
+        let model_node = self
+            .session
+            .as_ref()
+            .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
+            .and_then(|v| v.model_node.clone());
         let host = self
             .session_summary(agent_id, session_id)
             .and_then(|s| s.remote.as_ref())
-            .map(RemoteOwner::name);
+            .map(RemoteOwner::name)
+            .or_else(|| {
+                let node = model_node?;
+                let label = self.runtime.get(agent_id)?.models.iter().find_map(|m| {
+                    (m.node_id.as_deref() == Some(node.as_str()))
+                        .then(|| m.node.clone())
+                        .flatten()
+                });
+                Some(label.unwrap_or(node))
+            });
         if let Some(view) = self
             .session
             .as_mut()
