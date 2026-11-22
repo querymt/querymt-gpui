@@ -2945,7 +2945,7 @@ impl AgentsStore {
                     cx.notify();
                 });
                 // The prompt resolves when the turn ends; keep it running in the background.
-                let turn = rpc.request(
+                let turn = rpc.request_detailed(
                     "session/prompt",
                     json!({ "sessionId": session_id, "prompt": prompt_content(&prompt, &attachments, image_mode) }),
                 );
@@ -3666,7 +3666,7 @@ impl AgentsStore {
         );
         view.prompting = true;
         view.sync_work(crate::util::now_ms());
-        let turn = rpc.request(
+        let turn = rpc.request_detailed(
             "session/prompt",
             json!({ "sessionId": session_id, "prompt": content }),
         );
@@ -3963,9 +3963,19 @@ impl AgentsStore {
         &mut self,
         agent_id: &str,
         session_id: &str,
-        result: Result<Value, String>,
+        result: Result<Value, crate::rpc::RpcError>,
         cx: &mut Context<Self>,
     ) {
+        // A mesh host refused the model for a used-up usage limit.
+        let limits = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.raw())
+            .and_then(mesh_access::quota_exhausted);
+        let host = self
+            .session_summary(agent_id, session_id)
+            .and_then(|s| s.remote.as_ref())
+            .map(RemoteOwner::name);
         if let Some(view) = self
             .session
             .as_mut()
@@ -3974,6 +3984,16 @@ impl AgentsStore {
             view.prompting = false;
             view.sync_work(crate::util::now_ms());
             match &result {
+                Err(_) if limits.is_some() => view.push_notice_card(
+                    match host {
+                        Some(host) => format!("Usage limit reached on {host}"),
+                        None => "Usage limit reached".to_string(),
+                    },
+                    mesh_access::exhausted_lines(
+                        limits.as_deref().unwrap_or_default(),
+                        crate::util::now_ms(),
+                    ),
+                ),
                 Err(err) => view.push_notice(format!("Prompt failed: {err}"), true),
                 Ok(v) => match v.get("stopReason").and_then(Value::as_str) {
                     Some("cancelled") => view.push_notice("Stopped.", false),
@@ -5348,6 +5368,49 @@ async fn load_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn a_used_up_mesh_limit_explains_itself(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let mut store = launch::peer_fixture();
+        let (rpc, _requests) = store.rpc_for_test("test-agent");
+        store.runtime_mut_for_test("test-agent").sessions = vec![SessionSummary {
+            agent_id: "test-agent".into(),
+            id: "s".into(),
+            remote: Some(RemoteOwner {
+                node_id: "thor-id".into(),
+                label: Some("thor".into()),
+                connected: true,
+            }),
+            ..Default::default()
+        }];
+        store.session = Some(SessionView::new("test-agent", "s", "/w", "Remote"));
+        let store = cx.new(|_| store);
+        let turn = rpc.request_detailed("session/prompt", json!({}));
+        // The error querymt sends (`quota_denial_identifies_the_relevant_reset_time`).
+        rpc.handle(
+            &json!({ "id": 1, "error": {
+                "code": -32000, "message": "provider dispatch refused",
+                "data": { "code": "mesh_quota_exhausted", "retryable": false, "limits": [
+                    { "scope": { "provider_id": "codex", "model_id": "gpt-6.2-sol" },
+                      "available_tokens": "0" } ] } } })
+            .to_string(),
+        );
+        let result = futures::executor::block_on(turn);
+        store.update(cx, |s, cx| s.finish_prompt("test-agent", "s", result, cx));
+        cx.update(|cx| {
+            let view = store.read(cx).session.as_ref().unwrap();
+            let Some(crate::session::ItemKind::Notice { text, detail, .. }) =
+                view.items.last().map(|i| &i.kind)
+            else {
+                panic!("a notice");
+            };
+            assert_eq!(text, "Usage limit reached on thor");
+            assert_eq!(detail.len(), 1);
+            assert!(detail[0].starts_with("The limit for gpt-6.2-sol (codex) is used up."));
+            assert!(!text.contains("mesh_quota_exhausted"));
+        });
+    }
 
     #[test]
     fn reconnect_backs_off_like_the_web_client() {

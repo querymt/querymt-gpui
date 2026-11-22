@@ -3206,7 +3206,38 @@ fn render_item(ix: usize, item: &Item, rc: &RenderCtx) -> AnyElement {
                 el.child(turn_actions(ix, item, stats, rc))
             })
             .into_any_element(),
-        ItemKind::Notice { text, error } => h_flex()
+        // A limit or refusal that needs words, not a red line: a soft card.
+        ItemKind::Notice { text, detail, .. } if !detail.is_empty() => h_flex()
+            .w_full()
+            .items_start()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .rounded(px(12.))
+            .bg(p.warn.opacity(0.08))
+            .border_1()
+            .border_color(p.warn.opacity(0.25))
+            .child(
+                div()
+                    .pt(px(1.))
+                    .child(kit::icon(IconName::Gauge, 16., p.warn)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().text_sm().font_semibold().child(text.clone()))
+                    .children(detail.iter().map(|line| {
+                        div()
+                            .text_xs()
+                            .text_color(p.muted)
+                            .whitespace_normal()
+                            .child(line.clone())
+                    })),
+            )
+            .into_any_element(),
+        ItemKind::Notice { text, error, .. } => h_flex()
             .w_full()
             .justify_center()
             .gap_1p5()

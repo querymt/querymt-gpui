@@ -540,6 +540,9 @@ pub enum ItemKind {
     Notice {
         text: String,
         error: bool,
+        /// Explanation lines: shown as a card with `text` as its title
+        /// (e.g. which usage limit was reached and when it resets).
+        detail: Vec<String>,
     },
     /// Context-compaction boundary (desktop `SessionCompactionDivider`).
     Compaction(Box<Compaction>),
@@ -2226,6 +2229,20 @@ impl SessionView {
             ItemKind::Notice {
                 text: text.into(),
                 error,
+                detail: Vec::new(),
+            },
+        );
+    }
+
+    /// A notice card: a title and the lines explaining it.
+    pub fn push_notice_card(&mut self, title: impl Into<String>, detail: Vec<String>) {
+        let key = format!("notice-{}", self.counter + 1);
+        self.push(
+            key,
+            ItemKind::Notice {
+                text: title.into(),
+                error: true,
+                detail,
             },
         );
     }

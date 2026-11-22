@@ -496,6 +496,56 @@ impl AccessError {
     }
 }
 
+/// One exhausted scope of a `mesh_quota_exhausted` denial.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct LimitingQuota {
+    pub scope: QuotaScope,
+    #[serde(default, with = "tokens::opt")]
+    pub available_tokens: Option<u64>,
+    #[serde(default)]
+    pub next_reset_at: Option<String>,
+}
+
+/// `mesh_quota_exhausted` in a JSON-RPC error object: the limiting scopes.
+pub fn quota_exhausted(error: &Value) -> Option<Vec<LimitingQuota>> {
+    let data = error.get("data")?;
+    if data.get("code").and_then(Value::as_str) != Some("mesh_quota_exhausted") {
+        return None;
+    }
+    Some(
+        data.get("limits")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|l| serde_json::from_value(l.clone()).ok())
+            .collect(),
+    )
+}
+
+/// Human explanation of a quota denial for the session view: which limit,
+/// and when it comes back.
+pub fn exhausted_lines(limits: &[LimitingQuota], now_ms: f64) -> Vec<String> {
+    if limits.is_empty() {
+        return vec!["A usage limit set by the machine that runs this model is used up.".into()];
+    }
+    limits
+        .iter()
+        .map(|l| {
+            let what = match &l.scope.model_id {
+                Some(model) => format!("The limit for {model} ({})", l.scope.provider_id),
+                None => format!("The limit for all {} models", l.scope.provider_id),
+            };
+            match l.next_reset_at.as_deref() {
+                Some(at) => format!("{what} is used up. {}.", reset_label(at, now_ms)),
+                None => format!(
+                    "{what} is used up. It does not reset on its own: ask the owner of that \
+                     machine to reset or raise it."
+                ),
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Presentation helpers
 
@@ -1523,6 +1573,32 @@ mod tests {
             AccessError::from_rpc(&text),
             AccessError::Other(_)
         ));
+    }
+
+    #[test]
+    fn quota_exhaustion_names_the_scope_and_reset() {
+        // Shape of `quota_denial_identifies_the_relevant_reset_time`.
+        let error = json!({ "code": -32000, "message": "provider dispatch refused", "data": {
+            "code": "mesh_quota_exhausted", "retryable": false, "limits": [
+                { "scope": { "provider_id": "codex", "model_id": "gpt-6.2-sol" },
+                  "available_tokens": "0", "next_reset_at": "2026-11-23T00:00:00Z" },
+                { "scope": { "provider_id": "codex" }, "available_tokens": "0" }
+            ] } });
+        let limits = quota_exhausted(&error).unwrap();
+        assert_eq!(limits.len(), 2);
+        let now = crate::util::parse_rfc3339_ms("2026-11-22T19:00:00Z").unwrap();
+        let lines = exhausted_lines(&limits, now);
+        assert_eq!(
+            lines[0],
+            "The limit for gpt-6.2-sol (codex) is used up. Resets in 5h (Nov 23, 2026, 00:00 UTC)."
+        );
+        assert!(
+            lines[1].starts_with("The limit for all codex models is used up. It does not reset")
+        );
+        assert!(
+            quota_exhausted(&json!({ "code": -32000, "data": { "code": "mesh_access_denied" } }))
+                .is_none()
+        );
     }
 
     fn outgoing(revision: &str, grant: PeerGrant) -> Outgoing {
