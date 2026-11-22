@@ -11,6 +11,7 @@ mod devtools;
 pub(crate) mod fork;
 pub(crate) mod launch;
 pub(crate) mod mcp_notice;
+pub(crate) mod mesh_access;
 mod mesh_live;
 mod pins;
 pub(crate) mod plugins;
@@ -1202,6 +1203,10 @@ pub struct AgentRuntime {
     pub mesh: Option<MeshStatus>,
     pub mesh_nodes: Vec<MeshNode>,
     pub mesh_invites: Vec<MeshInvite>,
+    /// Peers with a saved sharing policy, online or not (`managed_peer_ids`).
+    pub managed_peers: Vec<String>,
+    /// Peer id -> what this machine and the peer share with each other.
+    pub sharing: mesh_access::SharingMap,
     /// URL of the invite created most recently in this app session.
     pub last_invite: Option<String>,
     /// Model providers of `_querymt/auth/status`.
@@ -4515,6 +4520,8 @@ impl AgentsStore {
                     self.on_pins_changed(id, &params, cx);
                 } else if mesh_live::is_membership_change(&method) {
                     self.on_mesh_membership_changed(id, cx);
+                } else if method.trim_start_matches('_') == mesh_access::CHANGED {
+                    self.on_peer_access_changed(id, &params, cx);
                 } else if method.trim_start_matches('_') == "querymt/session/mcpAuthRequired" {
                     self.on_mcp_auth_required(id, &params, cx);
                 } else if plugins::is_plugin_update(&method) {
@@ -5290,6 +5297,7 @@ async fn load_extras(
                         })
                         .collect();
                     rt.mesh_nodes.sort_by_key(|a| a.label.to_lowercase());
+                    rt.managed_peers = mesh_access::managed_peers(&v);
                 }
                 if let Ok(v) = invites {
                     let num = |i: &Value, k: &str| i.get(k).and_then(Value::as_f64).unwrap_or(0.0);
@@ -5316,6 +5324,8 @@ async fn load_extras(
         ) {
             return;
         }
+        // What each listed peer and this machine share with each other.
+        let _ = this.update(cx, |s, cx| s.load_all_peer_sharing(&id, cx));
     }
 
     let auth = rpc.request("_querymt/auth/status", json!({})).await;

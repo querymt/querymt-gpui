@@ -13,6 +13,7 @@ mod kit;
 mod log_view;
 mod md;
 mod mesh;
+mod mesh_sharing;
 mod preview;
 mod profile_select;
 mod session_view;
@@ -249,6 +250,8 @@ pub struct QmtApp {
     invite_qr: bool,
     invite_ttl: &'static str,
     invite_uses: Entity<InputState>,
+    /// Mesh page: peer sharing editor (open peer, drafts, limit editor).
+    sharing: mesh_sharing::SharingPage,
     settings_tab: SettingsTab,
     key_editing: Option<String>,
     /// Providers settings: expanded provider rows, the open auth-method menu,
@@ -471,6 +474,8 @@ impl QmtApp {
         subs.push(workspaces.subscribe(window, cx));
         let (log_view, log_sub) = log_view::LogView::new(window, cx);
         subs.push(log_sub);
+        let sharing = mesh_sharing::SharingPage::new(window, cx);
+        subs.push(sharing.subscribe(window, cx));
         let mut this = Self {
             store,
             page,
@@ -505,6 +510,7 @@ impl QmtApp {
             invite_qr: false,
             invite_ttl: "24h",
             invite_uses,
+            sharing,
             settings_tab: SettingsTab::General,
             key_editing: None,
             provider_open: HashSet::new(),
@@ -652,6 +658,7 @@ impl QmtApp {
             || std::mem::take(&mut self.invite_form)
             || self.details.take().is_some()
             || self.close_workspace_overlay()
+            || (self.page == Page::Mesh && self.sharing.close_editor())
         {
             return true;
         }
@@ -1153,7 +1160,7 @@ impl Render for QmtApp {
             Page::Start => self.render_start(cx).into_any_element(),
             Page::Sessions => self.render_sessions(cx).into_any_element(),
             Page::Agents => self.render_agents(cx).into_any_element(),
-            Page::Mesh => self.render_mesh(cx).into_any_element(),
+            Page::Mesh => self.render_mesh(window, cx).into_any_element(),
             Page::Automations => self.render_automations(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
             Page::Inbox => self.render_inbox(window, cx).into_any_element(),
