@@ -81,11 +81,20 @@ pub struct ProviderGrant {
 pub enum PeerGrant {
     None,
     Full,
+    /// Shell needs files, files need sessions.
     Custom {
         sessions: bool,
         filesystem: bool,
+        /// Sent only when on: agents before the shell switch refuse the
+        /// field, and newer ones default it to off.
+        #[serde(default, skip_serializing_if = "is_false")]
+        shell: bool,
         providers: Vec<ProviderGrant>,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -182,7 +191,7 @@ pub enum QuotaLimit {
 }
 
 impl QuotaLimit {
-    /// `5 Mtok a day`, `1 token`, `Unlimited`.
+    /// `5M tokens a day`, `1 token`, `Unlimited`.
     pub fn label(&self) -> String {
         match self {
             Self::Unlimited => "Unlimited".into(),
@@ -569,15 +578,43 @@ fn trim_decimal(text: String) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// `1 token`, `2,604 tokens`, `0.13 Mtok`, `5 Mtok`.
+/// A token count in a few characters: `999`, `2.6K`, `750K`, `1.25M`,
+/// `2,500M`. Exact below 1,000; K and M are rounded.
+pub fn short_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    // K with one decimal below 10K, whole K above; M with up to two
+    // decimals. Rounding up to 1000K reads as 1M.
+    let k = n as f64 / 1_000.;
+    let k_text = if k < 10. {
+        trim_decimal(format!("{k:.1}"))
+    } else {
+        format!("{k:.0}")
+    };
+    if n < 1_000_000 && k_text != "1000" {
+        return format!("{k_text}K");
+    }
+    let m = n as f64 / 1_000_000.;
+    let m_text = trim_decimal(format!("{m:.2}"));
+    match m_text.split_once('.') {
+        Some((whole, frac)) => format!("{}.{frac}M", group_text(whole)),
+        None => format!("{}M", group_text(&m_text)),
+    }
+}
+
+fn group_text(digits: &str) -> String {
+    digits
+        .parse::<u64>()
+        .map_or_else(|_| digits.to_string(), group_digits)
+}
+
+/// `1 token`, `604 tokens`, `2.6K tokens`, `1.25M tokens`.
 pub fn tokens_label(n: u64) -> String {
-    match n {
-        1 => "1 token".into(),
-        0..100_000 => format!("{} tokens", group_digits(n)),
-        _ => format!(
-            "{} Mtok",
-            trim_decimal(format!("{:.2}", n as f64 / 1_000_000.))
-        ),
+    if n == 1 {
+        "1 token".into()
+    } else {
+        format!("{} tokens", short_tokens(n))
     }
 }
 
@@ -590,46 +627,107 @@ pub fn exact_tokens(n: u64) -> String {
     }
 }
 
-/// Exact Mtok text of a token count (the editor's amount): `2.000001`.
-pub fn mtok_text(tokens: u64) -> String {
-    let (whole, frac) = (tokens / 1_000_000, tokens % 1_000_000);
-    if frac == 0 {
-        whole.to_string()
-    } else {
-        trim_decimal(format!("{whole}.{frac:06}"))
+/// Unit of a limit amount in the editor, like KB / MB for bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TokenUnit {
+    Tokens,
+    K,
+    #[default]
+    M,
+}
+
+impl TokenUnit {
+    pub const ALL: [TokenUnit; 3] = [Self::Tokens, Self::K, Self::M];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tokens => "tokens",
+            Self::K => "K",
+            Self::M => "M",
+        }
+    }
+
+    fn digits(self) -> u32 {
+        match self {
+            Self::Tokens => 0,
+            Self::K => 3,
+            Self::M => 6,
+        }
+    }
+
+    fn factor(self) -> u64 {
+        10u64.pow(self.digits())
+    }
+
+    /// The unit a limit is shown in when edited: the largest one it reaches.
+    pub fn for_tokens(n: u64) -> Self {
+        match n {
+            1_000_000.. => Self::M,
+            1_000.. => Self::K,
+            _ => Self::Tokens,
+        }
     }
 }
 
-/// A positive amount in Mtok (up to six decimals, so whole tokens) to tokens.
-pub fn parse_mtok(text: &str) -> Result<u64, &'static str> {
-    const ERR: &str = "Enter a positive amount in Mtok, e.g. 2.5 (up to 6 decimals).";
-    let text = text.trim();
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let (whole, frac) = text
-        .split_once('.')
-        .map_or((text, None), |(w, f)| (w, Some(f)));
-    let whole = if whole.is_empty() && frac.is_some() {
-        "0"
+/// Exact amount of `tokens` in `unit` (the editor's text): `2.000001` M.
+pub fn amount_text(tokens: u64, unit: TokenUnit) -> String {
+    let factor = unit.factor();
+    let (whole, frac) = (tokens / factor, tokens % factor);
+    if frac == 0 {
+        whole.to_string()
     } else {
-        whole
+        let width = unit.digits() as usize;
+        trim_decimal(format!("{whole}.{frac:0width$}"))
+    }
+}
+
+/// A positive amount in `unit` to whole tokens, exactly. Accepts `2.5`,
+/// `.5`, `1,000`, `1_000`; refuses fractions of a token and overflow.
+pub fn parse_amount(text: &str, unit: TokenUnit) -> Result<u64, String> {
+    let invalid = || match unit {
+        TokenUnit::Tokens => "Enter a whole number of tokens, e.g. 50000.".to_string(),
+        _ => format!("Enter an amount, e.g. 2.5 {}.", unit.label()),
     };
-    if !digits(whole) {
-        return Err(ERR);
+    let cleaned: String = text
+        .trim()
+        .chars()
+        .filter(|c| *c != ',' && *c != '_')
+        .collect();
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let (whole, frac) = cleaned
+        .split_once('.')
+        .map_or((cleaned.as_str(), ""), |(w, f)| (w, f));
+    if (whole.is_empty() && frac.is_empty()) || !digits(whole) || !digits(frac) {
+        return Err(invalid());
     }
-    let mut tokens = whole
-        .parse::<u64>()
-        .ok()
-        .and_then(|n| n.checked_mul(1_000_000))
-        .ok_or(ERR)?;
-    if let Some(frac) = frac {
-        if frac.len() > 6 || !digits(frac) {
-            return Err(ERR);
-        }
-        let part = frac.parse::<u64>().map_err(|_| ERR)? * 10u64.pow(6 - frac.len() as u32);
-        tokens = tokens.checked_add(part).ok_or(ERR)?;
+    let frac = frac.trim_end_matches('0');
+    if frac.len() > unit.digits() as usize {
+        return Err(match unit {
+            TokenUnit::Tokens => "Limits are whole tokens: no decimals.".to_string(),
+            _ => format!(
+                "That is a fraction of a token: use at most {} decimals with {}.",
+                unit.digits(),
+                unit.label()
+            ),
+        });
     }
+    let too_big = || "That is more tokens than a limit can hold.".to_string();
+    let whole = if whole.is_empty() {
+        0
+    } else {
+        whole.parse::<u64>().map_err(|_| too_big())?
+    };
+    let part = if frac.is_empty() {
+        0
+    } else {
+        frac.parse::<u64>().map_err(|_| invalid())? * 10u64.pow(unit.digits() - frac.len() as u32)
+    };
+    let tokens = whole
+        .checked_mul(unit.factor())
+        .and_then(|t| t.checked_add(part))
+        .ok_or_else(too_big)?;
     if tokens == 0 {
-        return Err(ERR);
+        return Err("A limit must be at least 1 token.".into());
     }
     Ok(tokens)
 }
@@ -674,13 +772,20 @@ pub fn reset_label(at: &str, now_ms: f64) -> String {
 /// Usage of one quota in a line: used, reserved, left, reset.
 pub fn usage_line(quota: &PeerQuota, now_ms: f64) -> String {
     let u = &quota.usage;
-    let mut parts = vec![format!("{} used", tokens_label(u.used()))];
+    let mut parts = vec![match quota.limit {
+        QuotaLimit::Finite { limit_tokens, .. } => format!(
+            "{} of {} used",
+            short_tokens(u.used()),
+            tokens_label(limit_tokens)
+        ),
+        QuotaLimit::Unlimited => format!("{} used", tokens_label(u.used())),
+    }];
     if let QuotaLimit::Finite { window, .. } = quota.limit {
         if let Some(reserved) = u.reserved_tokens.filter(|r| *r > 0) {
-            parts.push(format!("{} reserved", tokens_label(reserved)));
+            parts.push(format!("{} reserved", short_tokens(reserved)));
         }
         if let Some(left) = u.available_tokens {
-            parts.push(format!("{} left", tokens_label(left)));
+            parts.push(format!("{} left", short_tokens(left)));
         }
         parts.push(match u.next_reset_at.as_deref() {
             Some(at) => reset_label(at, now_ms),
@@ -689,7 +794,7 @@ pub fn usage_line(quota: &PeerQuota, now_ms: f64) -> String {
         });
     }
     if u.estimated_tokens > 0 {
-        parts.push(format!("{} estimated", tokens_label(u.estimated_tokens)));
+        parts.push(format!("{} estimated", short_tokens(u.estimated_tokens)));
     }
     if u.has_unknown_usage {
         parts.push("some usage unknown".into());
@@ -722,15 +827,22 @@ fn models_label(models: &ModelSelection) -> String {
     }
 }
 
-/// `Sessions, files, codex (all models)`.
-fn custom_summary(sessions: bool, filesystem: bool, providers: &[ProviderGrant]) -> String {
+/// `Sessions, files, shell, codex (all models)`.
+fn custom_summary(
+    sessions: bool,
+    filesystem: bool,
+    shell: bool,
+    providers: &[ProviderGrant],
+) -> String {
     let mut parts = Vec::new();
     if sessions {
-        parts.push(if filesystem {
-            "Sessions and files".to_string()
-        } else {
-            "Sessions".to_string()
-        });
+        parts.push("Sessions".to_string());
+    }
+    if filesystem {
+        parts.push("files".to_string());
+    }
+    if shell {
+        parts.push("shell".to_string());
     }
     match providers {
         [] => {}
@@ -756,8 +868,9 @@ pub fn grant_summary(grant: &PeerGrant) -> String {
         PeerGrant::Custom {
             sessions,
             filesystem,
+            shell,
             providers,
-        } => custom_summary(*sessions, *filesystem, providers),
+        } => custom_summary(*sessions, *filesystem, *shell, providers),
     }
 }
 
@@ -770,6 +883,7 @@ pub fn incoming_summary(incoming: Option<&Incoming>) -> String {
             AccessMode::Custom => custom_summary(
                 effective.sessions,
                 effective.filesystem,
+                effective.shell,
                 &effective.providers,
             ),
         },
@@ -794,11 +908,13 @@ pub fn grant_changes(old: &PeerGrant, new: &PeerGrant) -> Vec<String> {
         PeerGrant::Custom {
             sessions: s0,
             filesystem: f0,
+            shell: h0,
             providers: p0,
         },
         PeerGrant::Custom {
             sessions: s1,
             filesystem: f1,
+            shell: h1,
             providers: p1,
         },
     ) = (old, new)
@@ -820,6 +936,9 @@ pub fn grant_changes(old: &PeerGrant, new: &PeerGrant) -> Vec<String> {
     }
     if f0 != f1 {
         out.push(format!("Files turned {}.", on_off(*f1)));
+    }
+    if h0 != h1 {
+        out.push(format!("Shell turned {}.", on_off(*h1)));
     }
     let ids: BTreeSet<&str> = p0
         .iter()
@@ -890,8 +1009,6 @@ pub struct GrantDraft {
     /// Custom settings kept while No access or Full is picked, so switching
     /// back does not lose them.
     custom: PeerGrant,
-    /// The owner confirmed that Full includes the host shell.
-    pub full_ack: bool,
     /// The saved grant changed elsewhere since the draft started: what
     /// changed. Saving waits until the owner keeps or drops the draft.
     pub changed_elsewhere: Vec<String>,
@@ -901,8 +1018,17 @@ fn empty_custom() -> PeerGrant {
     PeerGrant::Custom {
         sessions: false,
         filesystem: false,
+        shell: false,
         providers: Vec::new(),
     }
+}
+
+/// The switches of a Custom grant being edited.
+struct CustomMut<'a> {
+    sessions: &'a mut bool,
+    filesystem: &'a mut bool,
+    shell: &'a mut bool,
+    providers: &'a mut Vec<ProviderGrant>,
 }
 
 impl GrantDraft {
@@ -916,7 +1042,6 @@ impl GrantDraft {
             base: outgoing.grant.clone(),
             grant: outgoing.grant.clone(),
             custom,
-            full_ack: false,
             changed_elsewhere: Vec::new(),
         }
     }
@@ -935,42 +1060,63 @@ impl GrantDraft {
             "custom" => self.custom.clone(),
             _ => PeerGrant::None,
         };
-        if mode != "full" {
-            self.full_ack = false;
-        }
     }
 
-    fn custom_mut(&mut self) -> Option<(&mut bool, &mut bool, &mut Vec<ProviderGrant>)> {
+    fn custom_mut(&mut self) -> Option<CustomMut<'_>> {
         match &mut self.grant {
             PeerGrant::Custom {
                 sessions,
                 filesystem,
+                shell,
                 providers,
-            } => Some((sessions, filesystem, providers)),
+            } => Some(CustomMut {
+                sessions,
+                filesystem,
+                shell,
+                providers,
+            }),
             _ => None,
         }
     }
 
-    /// Files need sessions: turning sessions off turns files off.
+    /// Files and shell need sessions: turning sessions off turns them off.
     pub fn set_sessions(&mut self, on: bool) {
-        if let Some((sessions, filesystem, _)) = self.custom_mut() {
-            *sessions = on;
+        if let Some(c) = self.custom_mut() {
+            *c.sessions = on;
             if !on {
-                *filesystem = false;
+                *c.filesystem = false;
+                *c.shell = false;
             }
         }
     }
 
+    /// Files need sessions (turned on with them); the shell needs files.
     pub fn set_filesystem(&mut self, on: bool) {
-        if let Some((sessions, filesystem, _)) = self.custom_mut() {
-            *filesystem = on && *sessions;
+        if let Some(c) = self.custom_mut() {
+            *c.filesystem = on;
+            if on {
+                *c.sessions = true;
+            } else {
+                *c.shell = false;
+            }
+        }
+    }
+
+    /// The shell needs files and sessions: turning it on turns them on.
+    pub fn set_shell(&mut self, on: bool) {
+        if let Some(c) = self.custom_mut() {
+            *c.shell = on;
+            if on {
+                *c.filesystem = true;
+                *c.sessions = true;
+            }
         }
     }
 
     /// Share a provider (all models) or stop sharing it; `order` keeps the
     /// catalog order.
     pub fn set_provider(&mut self, provider_id: &str, on: bool, order: &[String]) {
-        let Some((_, _, providers)) = self.custom_mut() else {
+        let Some(CustomMut { providers, .. }) = self.custom_mut() else {
             return;
         };
         providers.retain(|p| p.provider_id != provider_id);
@@ -987,7 +1133,7 @@ impl GrantDraft {
     /// All models of a shared provider, or a chosen list (started with
     /// `initial` when switching to a chosen list).
     pub fn set_all_models(&mut self, provider_id: &str, all: bool, initial: &[String]) {
-        let Some((_, _, providers)) = self.custom_mut() else {
+        let Some(CustomMut { providers, .. }) = self.custom_mut() else {
             return;
         };
         if let Some(p) = providers.iter_mut().find(|p| p.provider_id == provider_id) {
@@ -1005,7 +1151,7 @@ impl GrantDraft {
     }
 
     pub fn toggle_model(&mut self, provider_id: &str, model_id: &str) {
-        let Some((_, _, providers)) = self.custom_mut() else {
+        let Some(CustomMut { providers, .. }) = self.custom_mut() else {
             return;
         };
         if let Some(ProviderGrant {
@@ -1024,9 +1170,6 @@ impl GrantDraft {
     /// Why the draft cannot be saved as it is.
     pub fn problem(&self) -> Option<String> {
         match &self.grant {
-            PeerGrant::Full if !self.full_ack => {
-                Some("Confirm that you trust this peer with your shell.".into())
-            }
             PeerGrant::Custom { providers, .. } => providers
                 .iter()
                 .find(|p| {
@@ -1373,7 +1516,7 @@ mod tests {
             "peer_id": "12D3KooWPeer",
             "outgoing": {
                 "revision": "6f1c0a0e-0000-4000-8000-000000000001",
-                "grant": { "mode": "custom", "sessions": true, "filesystem": false, "providers": [
+                "grant": { "mode": "custom", "sessions": true, "filesystem": false, "shell": false, "providers": [
                     { "provider_id": "codex", "models": { "mode": "selected", "model_ids": ["gpt-6.2-sol"] } }
                 ] },
                 "quotas": [{
@@ -1417,7 +1560,23 @@ mod tests {
         };
         assert_eq!(limit_tokens, 9_007_199_254_740_993);
         assert_eq!(window, QuotaWindow::Daily);
-        assert_eq!(serde_json::to_value(&access).unwrap(), wire);
+        // `shell: false` is the default and is not sent back.
+        let mut sent = wire.clone();
+        sent["outgoing"]["grant"]
+            .as_object_mut()
+            .unwrap()
+            .remove("shell");
+        assert_eq!(serde_json::to_value(&access).unwrap(), sent);
+        // A Custom grant from an agent without the shell switch reads as no shell.
+        let older: PeerGrant = serde_json::from_value(
+            json!({ "mode": "custom", "sessions": true, "filesystem": true, "providers": [] }),
+        )
+        .unwrap();
+        assert!(matches!(older, PeerGrant::Custom { shell: false, .. }));
+        assert_eq!(
+            serde_json::to_value(&older).unwrap(),
+            json!({ "mode": "custom", "sessions": true, "filesystem": true, "providers": [] })
+        );
     }
 
     #[test]
@@ -1474,6 +1633,7 @@ mod tests {
         let (_, params) = Write::Grant(PeerGrant::Custom {
             sessions: true,
             filesystem: true,
+            shell: true,
             providers: vec![ProviderGrant {
                 provider_id: "codex".into(),
                 models: ModelSelection::All,
@@ -1482,36 +1642,82 @@ mod tests {
         .request("peer", "r");
         assert_eq!(
             params["grant"],
-            json!({ "mode": "custom", "sessions": true, "filesystem": true,
+            json!({ "mode": "custom", "sessions": true, "filesystem": true, "shell": true,
                     "providers": [{ "provider_id": "codex", "models": { "mode": "all" } }] })
         );
     }
 
     #[test]
-    fn mtok_amounts_are_exact() {
-        assert_eq!(parse_mtok("2.000001"), Ok(2_000_001));
-        assert_eq!(parse_mtok(" 5 "), Ok(5_000_000));
-        assert_eq!(parse_mtok(".5"), Ok(500_000));
-        assert_eq!(parse_mtok("0.000001"), Ok(1));
-        for bad in [
-            "",
-            "0",
-            "0.0",
-            "-1",
-            "1.0000001",
-            "1e3",
-            "abc",
-            "18446744073710",
+    fn token_amounts_are_exact_in_every_unit() {
+        use TokenUnit::*;
+        assert_eq!(parse_amount("2.000001", M), Ok(2_000_001));
+        assert_eq!(parse_amount(" 5 ", M), Ok(5_000_000));
+        assert_eq!(parse_amount(".5", M), Ok(500_000));
+        assert_eq!(parse_amount("750", K), Ok(750_000));
+        assert_eq!(parse_amount("1.5", K), Ok(1_500));
+        assert_eq!(parse_amount("1,000", Tokens), Ok(1_000));
+        assert_eq!(parse_amount("1.000", Tokens), Ok(1), "trailing zeros");
+        assert_eq!(parse_amount("0.000001", M), Ok(1));
+        assert_eq!(parse_amount("18446744073709551615", Tokens), Ok(u64::MAX));
+        for (bad, unit) in [
+            ("", M),
+            (".", M),
+            ("0", M),
+            ("0.0", K),
+            ("-1", M),
+            ("1e3", Tokens),
+            ("abc", K),
         ] {
-            assert!(parse_mtok(bad).is_err(), "{bad}");
+            assert!(parse_amount(bad, unit).is_err(), "{bad}");
         }
-        for n in [1, 2_000_001, 5_000_000, 123_456_789] {
-            assert_eq!(parse_mtok(&mtok_text(n)), Ok(n));
+        // Fractions of a token and overflow say so.
+        assert!(
+            parse_amount("1.0000001", M)
+                .unwrap_err()
+                .contains("fraction")
+        );
+        assert!(
+            parse_amount("1.5", Tokens)
+                .unwrap_err()
+                .contains("whole tokens")
+        );
+        assert!(parse_amount("0.0005", K).unwrap_err().contains("fraction"));
+        assert!(
+            parse_amount("18446744073710", M)
+                .unwrap_err()
+                .contains("more tokens")
+        );
+        assert!(
+            parse_amount("18446744073709551616", Tokens)
+                .unwrap_err()
+                .contains("more tokens")
+        );
+        for n in [1, 999, 1_500, 2_000_001, 5_000_000, 123_456_789, u64::MAX] {
+            let unit = TokenUnit::for_tokens(n);
+            assert_eq!(parse_amount(&amount_text(n, unit), unit), Ok(n), "{n}");
+            for unit in TokenUnit::ALL {
+                assert_eq!(parse_amount(&amount_text(n, unit), unit), Ok(n), "{n}");
+            }
         }
+        assert_eq!(amount_text(2_500_000, M), "2.5");
+        assert_eq!(amount_text(750_000, K), "750");
+        assert_eq!(TokenUnit::for_tokens(750_000), K);
+        assert_eq!(TokenUnit::for_tokens(2_500_000), M);
+        assert_eq!(TokenUnit::for_tokens(12), Tokens);
+    }
+
+    #[test]
+    fn token_counts_read_as_numbers() {
         assert_eq!(tokens_label(1), "1 token");
-        assert_eq!(tokens_label(2604), "2,604 tokens");
-        assert_eq!(tokens_label(2_500_000), "2.5 Mtok");
-        assert_eq!(tokens_label(128_089), "0.13 Mtok");
+        assert_eq!(tokens_label(604), "604 tokens");
+        assert_eq!(short_tokens(2_604), "2.6K");
+        assert_eq!(short_tokens(750_000), "750K");
+        assert_eq!(short_tokens(128_089), "128K");
+        assert_eq!(short_tokens(999_999), "1M");
+        assert_eq!(short_tokens(1_200_000), "1.2M");
+        assert_eq!(short_tokens(2_500_000), "2.5M");
+        assert_eq!(short_tokens(2_500_000_000), "2,500M");
+        assert_eq!(tokens_label(2_500_000), "2.5M tokens");
     }
 
     #[test]
@@ -1642,28 +1848,37 @@ mod tests {
         let mut draft = GrantDraft::new(&outgoing("r", PeerGrant::None));
         assert!(!draft.dirty());
         draft.set_mode("custom");
-        draft.set_filesystem(true);
-        assert!(
-            matches!(
-                draft.grant,
-                PeerGrant::Custom {
-                    filesystem: false,
-                    ..
-                }
-            ),
-            "files need sessions"
-        );
-        draft.set_sessions(true);
-        draft.set_filesystem(true);
-        draft.set_sessions(false);
-        assert!(matches!(
-            draft.grant,
+        let switches = |d: &GrantDraft| match d.grant {
             PeerGrant::Custom {
-                sessions: false,
-                filesystem: false,
+                sessions,
+                filesystem,
+                shell,
                 ..
-            }
-        ));
+            } => (sessions, filesystem, shell),
+            _ => panic!("custom"),
+        };
+        draft.set_shell(true);
+        assert_eq!(
+            switches(&draft),
+            (true, true, true),
+            "shell needs files and sessions"
+        );
+        draft.set_sessions(false);
+        assert_eq!(
+            switches(&draft),
+            (false, false, false),
+            "sessions off turns all off"
+        );
+        draft.set_filesystem(true);
+        assert_eq!(switches(&draft), (true, true, false), "files need sessions");
+        draft.set_shell(true);
+        draft.set_filesystem(false);
+        assert_eq!(
+            switches(&draft),
+            (true, false, false),
+            "files off turns shell off"
+        );
+        draft.set_sessions(false);
         let order = vec!["anthropic".to_string(), "codex".to_string()];
         draft.set_provider("codex", true, &order);
         draft.set_provider("anthropic", true, &order);
@@ -1675,22 +1890,20 @@ mod tests {
             panic!()
         };
         assert_eq!(providers[0].provider_id, "anthropic", "catalog order");
-        // Full needs an acknowledgement; Custom settings survive a detour.
+        // Custom settings survive a detour through Full.
         let custom = draft.grant.clone();
         draft.set_mode("full");
-        assert!(draft.problem().is_some());
-        draft.full_ack = true;
         assert!(draft.can_save());
         draft.set_mode("custom");
         assert_eq!(draft.grant, custom);
-        assert!(!draft.full_ack);
     }
 
     #[test]
     fn changes_read_as_sentences() {
         let custom = |sessions, providers: Vec<ProviderGrant>| PeerGrant::Custom {
             sessions,
-            filesystem: false,
+            filesystem: sessions,
+            shell: sessions,
             providers,
         };
         let all = |id: &str| ProviderGrant {
@@ -1704,6 +1917,8 @@ mod tests {
             ),
             vec![
                 "Sessions turned on.",
+                "Files turned on.",
+                "Shell turned on.",
                 "Stopped sharing codex.",
                 "Now shares openai (all models)."
             ]
@@ -1717,8 +1932,8 @@ mod tests {
         assert_eq!(
             quota_changes(&access.outgoing.quotas, &later.quotas),
             vec![
-                "Limit for gpt-6.2-sol (codex) changed from 9007199254.74 Mtok a day \
-                 to 5 Mtok a week."
+                "Limit for gpt-6.2-sol (codex) changed from 9,007,199,254.74M tokens a day \
+                 to 5M tokens a week."
             ]
         );
         let mut reset = access.outgoing.clone();
@@ -1742,11 +1957,36 @@ mod tests {
         );
         assert_eq!(incoming_summary(Some(&Incoming::Denied)), "Nothing");
         assert_eq!(grant_summary(&PeerGrant::Full), "Full access");
+        let shell = PeerGrant::Custom {
+            sessions: true,
+            filesystem: true,
+            shell: true,
+            providers: Vec::new(),
+        };
+        assert_eq!(grant_summary(&shell), "Sessions, files, shell");
+        let mut granted: Incoming = serde_json::from_value(json!({ "status": "granted",
+            "effective": { "mode": "custom", "sessions": true, "filesystem": true, "shell": true,
+                           "providers": [] }, "quotas": [] }))
+        .unwrap();
+        assert_eq!(incoming_summary(Some(&granted)), "Sessions, files, shell");
+        if let Incoming::Granted { effective, .. } = &mut granted {
+            effective.shell = false;
+        }
+        assert_eq!(incoming_summary(Some(&granted)), "Sessions, files");
         let now = crate::util::parse_rfc3339_ms("2026-11-22T22:30:00Z").unwrap();
+        let mut quota = access.outgoing.quotas[0].clone();
         assert_eq!(
-            usage_line(&access.outgoing.quotas[0], now),
-            "2,604 tokens used · 0.13 Mtok reserved · 0 tokens left · Resets in 1h (Nov 23, 2026, 00:00 UTC)"
+            usage_line(&quota, now),
+            "2.6K of 9,007,199,254.74M tokens used · 128K reserved · 0 left · Resets in 1h (Nov 23, 2026, 00:00 UTC)"
         );
+        quota.limit = QuotaLimit::Finite {
+            limit_tokens: 2_500_000,
+            window: QuotaWindow::Daily,
+        };
+        quota.usage.known_tokens = 1_750_000;
+        quota.usage.reserved_tokens = None;
+        quota.usage.available_tokens = Some(750_000);
+        assert!(usage_line(&quota, now).starts_with("1.75M of 2.5M tokens used · 750K left · "));
         assert!(access.outgoing.quotas[0].exhausted());
         assert_eq!(usage_fraction(&access.outgoing.quotas[1]), None);
     }

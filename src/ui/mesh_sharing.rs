@@ -23,7 +23,7 @@ use super::{QmtApp, kit};
 use crate::store::mesh_access::{
     self as access, AccessError, GrantDraft, Incoming, ModelSelection, Outgoing, PeerAccess,
     PeerGrant, PeerQuota, PeerSharing, QuotaLimit, QuotaScope, QuotaWindow, ShareableProvider,
-    Write,
+    TokenUnit, Write,
 };
 use crate::theme::{Palette, palette};
 use crate::util::now_ms;
@@ -42,6 +42,8 @@ struct QuotaEdit {
     peer: String,
     scope: QuotaScope,
     window: QuotaWindow,
+    /// Unit of the amount field.
+    unit: TokenUnit,
     /// The saved limit when the editor opened.
     existing: Option<QuotaLimit>,
 }
@@ -303,10 +305,10 @@ impl QmtApp {
         };
         let (peer, scope) = (edit.peer.clone(), edit.scope.clone());
         let key = (peer.clone(), Op::Quota(scope.clone()));
-        let tokens = match access::parse_mtok(&self.sharing.amount.read(cx).value()) {
+        let tokens = match access::parse_amount(&self.sharing.amount.read(cx).value(), edit.unit) {
             Ok(tokens) => tokens,
             Err(err) => {
-                self.sharing.errors.insert(key, err.to_string());
+                self.sharing.errors.insert(key, err);
                 cx.notify();
                 return;
             }
@@ -337,12 +339,15 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (text, win) = match &existing {
+        let (text, win, unit) = match &existing {
             Some(QuotaLimit::Finite {
                 limit_tokens,
                 window,
-            }) => (access::mtok_text(*limit_tokens), *window),
-            _ => (String::new(), QuotaWindow::Daily),
+            }) => {
+                let unit = TokenUnit::for_tokens(*limit_tokens);
+                (access::amount_text(*limit_tokens, unit), *window, unit)
+            }
+            _ => (String::new(), QuotaWindow::Daily, TokenUnit::M),
         };
         self.sharing
             .errors
@@ -351,6 +356,7 @@ impl QmtApp {
             peer: peer.to_string(),
             scope,
             window: win,
+            unit,
             existing,
         });
         self.sharing.amount.update(cx, |s, cx| {
@@ -516,7 +522,12 @@ impl QmtApp {
                                 kit::chip("idle", p)
                             })
                             .when(
-                                access.is_some_and(|a| a.outgoing.grant == PeerGrant::Full),
+                                access.is_some_and(|a| {
+                                    matches!(
+                                        a.outgoing.grant,
+                                        PeerGrant::Full | PeerGrant::Custom { shell: true, .. }
+                                    )
+                                }),
                                 |el| {
                                     el.child(kit::icon_tone_chip(
                                         IconName::SquareTerminal,
@@ -773,24 +784,24 @@ impl QmtApp {
             )
             .child(subtle_text(p).flex_1().min_w_0().child(match mode {
                 "none" => format!("{name} can see this machine in the mesh, nothing more."),
-                "custom" => "Only what you turn on below. Never the shell.".to_string(),
-                _ => "Sessions, files, every model, and the shell.".to_string(),
+                "custom" => "Only what you turn on below.".to_string(),
+                _ => String::new(),
             }));
 
         let body = match &grant {
             PeerGrant::None => None,
-            PeerGrant::Full => Some(self.full_warning(peer, hostname, draft.as_ref(), p, cx)),
+            PeerGrant::Full => Some(full_warning(p)),
             PeerGrant::Custom {
                 sessions,
                 filesystem,
+                shell,
                 ..
             } => Some(self.custom_editor(
                 agent,
                 peer,
                 access,
                 &grant,
-                *sessions,
-                *filesystem,
+                (*sessions, *filesystem, *shell),
                 saving,
                 p,
                 window,
@@ -976,66 +987,6 @@ impl QmtApp {
             .children(idle_limits)
     }
 
-    fn full_warning(
-        &self,
-        peer: &PeerView,
-        hostname: &str,
-        draft: Option<&GrantDraft>,
-        p: &Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let name = peer.name.clone();
-        // Already saved as Full: the warning stays, the checkbox does not.
-        let pending = draft.is_some_and(|d| d.dirty());
-        let acked = draft.is_some_and(|d| d.full_ack);
-        let id = peer.id.clone();
-        v_flex()
-            .gap_2()
-            .px_3()
-            .py_2p5()
-            .rounded(px(10.))
-            .bg(p.warn.opacity(0.08))
-            .border_1()
-            .border_color(p.warn.opacity(0.3))
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .text_sm()
-                    .font_semibold()
-                    .child(kit::icon(IconName::ShieldAlert, 15., p.warn))
-                    .child(format!("{name} can run any command on {hostname}")),
-            )
-            .child(subtle_text(p).whitespace_normal().child(
-                "Full access includes the shell. Commands run as the user running \
-                         qmtcode here, with all of that user's permissions and files, outside \
-                         any sandbox. Approvals you set up on this machine still apply. \
-                         Usage limits do not apply to full access.",
-            ))
-            .when(pending, |el| {
-                el.child(
-                    h_flex()
-                        .id(kit::keyed("full-ack", peer.id.clone()))
-                        .gap_2()
-                        .cursor_pointer()
-                        .text_sm()
-                        .child(kit::icon(
-                            if acked {
-                                IconName::SquareCheckBig
-                            } else {
-                                IconName::Square
-                            },
-                            15.,
-                            if acked { p.warn } else { p.muted },
-                        ))
-                        .child(format!("I trust {name} with my account on {hostname}"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.edit_draft(&id, cx, |d| d.full_ack = !d.full_ack);
-                        })),
-                )
-            })
-            .into_any_element()
-    }
-
     /// A labelled switch row inside the editor.
     #[allow(clippy::too_many_arguments)]
     fn toggle_row(
@@ -1076,8 +1027,7 @@ impl QmtApp {
         peer: &PeerView,
         access: &PeerAccess,
         grant: &PeerGrant,
-        sessions: bool,
-        filesystem: bool,
+        (sessions, filesystem, shell): (bool, bool, bool),
         saving: bool,
         p: &Palette,
         window: &mut Window,
@@ -1085,7 +1035,7 @@ impl QmtApp {
     ) -> AnyElement {
         let catalog: Vec<ShareableProvider> = access.shareable_catalog.clone().unwrap_or_default();
         let order: Vec<String> = catalog.iter().map(|c| c.provider_id.clone()).collect();
-        let (s_id, f_id) = (peer.id.clone(), peer.id.clone());
+        let (s_id, f_id, x_id) = (peer.id.clone(), peer.id.clone(), peer.id.clone());
         let toggles = v_flex()
             .gap_3()
             .child(self.toggle_row(
@@ -1106,16 +1056,23 @@ impl QmtApp {
                 kit::keyed("share-files", peer.id.clone()),
                 IconName::Folder,
                 "Files",
-                if sessions {
-                    "Read and change files inside a session's workspace, nowhere else.".into()
-                } else {
-                    "Needs Sessions.".into()
-                },
+                "Read and change files inside a session's workspace, nowhere else.".into(),
                 filesystem,
-                sessions && !saving,
+                !saving,
                 p,
                 cx,
                 move |this, v, cx| this.edit_draft(&f_id, cx, |d| d.set_filesystem(v)),
+            ))
+            .child(self.toggle_row(
+                kit::keyed("share-shell", peer.id.clone()),
+                IconName::SquareTerminal,
+                "Shell",
+                "Allows the unsandboxed shell.".into(),
+                shell,
+                !saving,
+                p,
+                cx,
+                move |this, v, cx| this.edit_draft(&x_id, cx, |d| d.set_shell(v)),
             ));
 
         // Providers the grant names that this machine no longer offers.
@@ -1133,8 +1090,7 @@ impl QmtApp {
                 v_flex()
                     .child(div().text_sm().font_medium().child("Models"))
                     .child(subtle_text(p).child(format!(
-                        "Providers set up on this machine that {} may use. Its requests use your \
-                         credentials.",
+                        "Providers set up on this machine that {} may use.",
                         peer.name
                     ))),
             )
@@ -1638,8 +1594,8 @@ impl QmtApp {
         };
         let key = format!("{}-{}", peer.id, scope.key());
         let text = self.sharing.amount.read(cx).value().to_string();
-        let parsed = access::parse_mtok(&text);
-        let new_limit = parsed.ok().map(|tokens| QuotaLimit::Finite {
+        let parsed = access::parse_amount(&text, edit.unit);
+        let new_limit = parsed.as_ref().ok().map(|&tokens| QuotaLimit::Finite {
             limit_tokens: tokens,
             window: edit.window,
         });
@@ -1678,8 +1634,23 @@ impl QmtApp {
                 edit.window.describe()
             ),
             Err(_) if text.trim().is_empty() => edit.window.describe().to_string(),
-            Err(err) => err.to_string(),
+            Err(err) => err.clone(),
         };
+        let units = kit::segment_bar(p).children(TokenUnit::ALL.into_iter().map(|u| {
+            kit::segment(
+                kit::keyed("quota-unit", format!("{key}-{}", u.label())),
+                edit.unit == u,
+                p,
+            )
+            .label(u.label())
+            .inactive(busy)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(e) = this.sharing.edit.as_mut() {
+                    e.unit = u;
+                }
+                cx.notify();
+            }))
+        }));
         v_flex()
             .gap_2()
             .px_3()
@@ -1697,15 +1668,15 @@ impl QmtApp {
                     .gap_2()
                     .flex_wrap()
                     .child(
-                        kit::field_shell(focused, p).w(px(140.)).h(px(32.)).child(
+                        kit::field_shell(focused, p).w(px(120.)).h(px(32.)).child(
                             Input::new(&self.sharing.amount)
                                 .appearance(false)
-                                .aria_label("Limit in Mtok")
+                                .aria_label("Limit amount")
                                 .disabled(busy)
                                 .flex_1(),
                         ),
                     )
-                    .child(div().text_sm().text_color(p.muted).child("Mtok"))
+                    .child(units)
                     .child(windows)
                     .child(div().flex_1())
                     .child(
@@ -1905,6 +1876,22 @@ fn incoming_view(peer: &PeerView, access: &PeerAccess, p: &Palette) -> Div {
     v_flex().gap_2().child(title).child(body)
 }
 
+/// Full, said plainly.
+fn full_warning(p: &Palette) -> AnyElement {
+    h_flex()
+        .gap_1p5()
+        .px_3()
+        .py_2()
+        .rounded(px(10.))
+        .bg(p.warn.opacity(0.08))
+        .border_1()
+        .border_color(p.warn.opacity(0.3))
+        .text_sm()
+        .child(kit::icon(IconName::ShieldAlert, 15., p.warn))
+        .child("Full: everything, including the unsandboxed shell, no limits.")
+        .into_any_element()
+}
+
 /// Label column of a limit line.
 fn limit_label(text: &'static str, p: &Palette) -> Div {
     div()
@@ -2012,14 +1999,11 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn full_access_needs_the_shell_acknowledgement(cx: &mut gpui_kit::TestAppContext) {
+    fn full_access_saves_and_clears_the_draft(cx: &mut gpui_kit::TestAppContext) {
         let h = harness(cx);
         cx.update(|cx| {
             h.app.update(cx, |app, cx| {
                 app.edit_draft("peer-a-id", cx, |d| d.set_mode("full"));
-                let draft = &app.sharing.drafts["peer-a-id"];
-                assert!(!draft.can_save(), "not before the acknowledgement");
-                app.edit_draft("peer-a-id", cx, |d| d.full_ack = true);
                 assert!(app.sharing.drafts["peer-a-id"].can_save());
             })
         });
@@ -2103,6 +2087,52 @@ mod tests {
             let error = &app.sharing.errors[&("peer-a-id".to_string(), Op::Grant)];
             assert!(error.starts_with("Not saved: sharing for this peer changed elsewhere."));
             assert!(error.contains("No access to Full access"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_shell_switch_is_saved_and_read_back(cx: &mut gpui_kit::TestAppContext) {
+        let h = harness(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.edit_draft("peer-a-id", cx, |d| d.set_mode("custom"));
+                app.edit_draft("peer-a-id", cx, |d| d.set_shell(true));
+                let grant = app.sharing.drafts["peer-a-id"].grant.clone();
+                app.sharing_write(
+                    "test-agent",
+                    "peer-a-id",
+                    Op::Grant,
+                    Write::Grant(grant),
+                    cx,
+                );
+            })
+        });
+        h.render(cx);
+        cx.run_until_parked();
+        let write = h.next();
+        let grant = json!({ "mode": "custom", "sessions": true, "filesystem": true,
+                            "shell": true, "providers": [] });
+        assert_eq!(write["params"]["grant"], grant);
+        h.reply(
+            &write,
+            json!({ "version": 1, "peer_id": "peer-a-id", "outgoing": {
+                "revision": "r2", "grant": grant, "quotas": [] } }),
+            cx,
+        );
+        h.render(cx);
+        cx.update(|cx| {
+            let app = h.app.read(cx);
+            assert!(app.sharing.drafts.is_empty(), "saved: the draft is gone");
+            let saved = app
+                .store
+                .read(cx)
+                .peer_sharing("test-agent", "peer-a-id")
+                .and_then(|s| s.access.clone())
+                .unwrap();
+            assert_eq!(
+                crate::store::mesh_access::grant_summary(&saved.outgoing.grant),
+                "Sessions, files, shell"
+            );
         });
     }
 }
