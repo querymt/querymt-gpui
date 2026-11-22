@@ -579,13 +579,13 @@ fn trim_decimal(text: String) -> String {
 }
 
 /// A token count in a few characters: `999`, `2.6K`, `750K`, `1.25M`,
-/// `2,500M`. Exact below 1,000; K and M are rounded.
+/// `2.5B`, `18,446,744,073.71B`. Exact below 1,000; K, M and B are rounded.
 pub fn short_tokens(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
-    // K with one decimal below 10K, whole K above; M with up to two
-    // decimals. Rounding up to 1000K reads as 1M.
+    // K with one decimal below 10K, whole K above; M and B with up to two
+    // decimals. Rounding up to 1000K reads as 1M, 1000M as 1B.
     let k = n as f64 / 1_000.;
     let k_text = if k < 10. {
         trim_decimal(format!("{k:.1}"))
@@ -595,11 +595,14 @@ pub fn short_tokens(n: u64) -> String {
     if n < 1_000_000 && k_text != "1000" {
         return format!("{k_text}K");
     }
-    let m = n as f64 / 1_000_000.;
-    let m_text = trim_decimal(format!("{m:.2}"));
-    match m_text.split_once('.') {
-        Some((whole, frac)) => format!("{}.{frac}M", group_text(whole)),
-        None => format!("{}M", group_text(&m_text)),
+    let m_text = trim_decimal(format!("{:.2}", n as f64 / 1_000_000.));
+    if n < 1_000_000_000 && m_text != "1000" {
+        return format!("{m_text}M");
+    }
+    let b_text = trim_decimal(format!("{:.2}", n as f64 / 1_000_000_000.));
+    match b_text.split_once('.') {
+        Some((whole, frac)) => format!("{}.{frac}B", group_text(whole)),
+        None => format!("{}B", group_text(&b_text)),
     }
 }
 
@@ -634,16 +637,18 @@ pub enum TokenUnit {
     K,
     #[default]
     M,
+    B,
 }
 
 impl TokenUnit {
-    pub const ALL: [TokenUnit; 3] = [Self::Tokens, Self::K, Self::M];
+    pub const ALL: [TokenUnit; 4] = [Self::Tokens, Self::K, Self::M, Self::B];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Tokens => "tokens",
             Self::K => "K",
             Self::M => "M",
+            Self::B => "B",
         }
     }
 
@@ -652,6 +657,7 @@ impl TokenUnit {
             Self::Tokens => 0,
             Self::K => 3,
             Self::M => 6,
+            Self::B => 9,
         }
     }
 
@@ -662,6 +668,7 @@ impl TokenUnit {
     /// The unit a limit is shown in when edited: the largest one it reaches.
     pub fn for_tokens(n: u64) -> Self {
         match n {
+            1_000_000_000.. => Self::B,
             1_000_000.. => Self::M,
             1_000.. => Self::K,
             _ => Self::Tokens,
@@ -1655,6 +1662,8 @@ mod tests {
         assert_eq!(parse_amount(".5", M), Ok(500_000));
         assert_eq!(parse_amount("750", K), Ok(750_000));
         assert_eq!(parse_amount("1.5", K), Ok(1_500));
+        assert_eq!(parse_amount("2.5", B), Ok(2_500_000_000));
+        assert_eq!(parse_amount("0.000000001", B), Ok(1));
         assert_eq!(parse_amount("1,000", Tokens), Ok(1_000));
         assert_eq!(parse_amount("1.000", Tokens), Ok(1), "trailing zeros");
         assert_eq!(parse_amount("0.000001", M), Ok(1));
@@ -1704,6 +1713,8 @@ mod tests {
         assert_eq!(TokenUnit::for_tokens(750_000), K);
         assert_eq!(TokenUnit::for_tokens(2_500_000), M);
         assert_eq!(TokenUnit::for_tokens(12), Tokens);
+        assert_eq!(TokenUnit::for_tokens(2_500_000_000), B);
+        assert_eq!(amount_text(2_500_000_000, B), "2.5");
     }
 
     #[test]
@@ -1716,7 +1727,9 @@ mod tests {
         assert_eq!(short_tokens(999_999), "1M");
         assert_eq!(short_tokens(1_200_000), "1.2M");
         assert_eq!(short_tokens(2_500_000), "2.5M");
-        assert_eq!(short_tokens(2_500_000_000), "2,500M");
+        assert_eq!(short_tokens(999_999_999), "1B");
+        assert_eq!(short_tokens(2_500_000_000), "2.5B");
+        assert_eq!(short_tokens(u64::MAX), "18,446,744,073.71B");
         assert_eq!(tokens_label(2_500_000), "2.5M tokens");
     }
 
@@ -1932,7 +1945,7 @@ mod tests {
         assert_eq!(
             quota_changes(&access.outgoing.quotas, &later.quotas),
             vec![
-                "Limit for gpt-6.2-sol (codex) changed from 9,007,199,254.74M tokens a day \
+                "Limit for gpt-6.2-sol (codex) changed from 9,007,199.25B tokens a day \
                  to 5M tokens a week."
             ]
         );
@@ -1977,7 +1990,7 @@ mod tests {
         let mut quota = access.outgoing.quotas[0].clone();
         assert_eq!(
             usage_line(&quota, now),
-            "2.6K of 9,007,199,254.74M tokens used · 128K reserved · 0 left · Resets in 1h (Nov 23, 2026, 00:00 UTC)"
+            "2.6K of 9,007,199.25B tokens used · 128K reserved · 0 left · Resets in 1h (Nov 23, 2026, 00:00 UTC)"
         );
         quota.limit = QuotaLimit::Finite {
             limit_tokens: 2_500_000,
