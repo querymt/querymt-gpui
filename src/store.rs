@@ -1207,6 +1207,9 @@ pub struct AgentRuntime {
     pub managed_peers: Vec<String>,
     /// Peer id -> what this machine and the peer share with each other.
     pub sharing: mesh_access::SharingMap,
+    /// Peer id -> its last known node label, so a peer that went offline
+    /// keeps its name while the app runs.
+    pub peer_labels: HashMap<String, String>,
     /// URL of the invite created most recently in this app session.
     pub last_invite: Option<String>,
     /// Model providers of `_querymt/auth/status`.
@@ -5317,6 +5320,9 @@ async fn load_extras(
                         })
                         .collect();
                     rt.mesh_nodes.sort_by_key(|a| a.label.to_lowercase());
+                    for n in rt.mesh_nodes.iter().filter(|n| !n.label.is_empty()) {
+                        rt.peer_labels.insert(n.id.clone(), n.label.clone());
+                    }
                     rt.managed_peers = mesh_access::managed_peers(&v);
                 }
                 if let Ok(v) = invites {

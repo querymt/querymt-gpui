@@ -55,6 +55,9 @@ pub(super) struct SharingPage {
     /// Refused as stale: the outgoing state the write was based on, until
     /// the re-read shows what changed instead.
     stale: HashMap<(String, Op), Outgoing>,
+    /// Refused while a request was using the limit: its settled usage then.
+    /// Once that changes the request is over and the notice goes.
+    busy_refusals: HashMap<(String, Op), (u64, Option<String>)>,
     edit: Option<QuotaEdit>,
     amount: Entity<InputState>,
     /// `peer/provider` rows with their model list open.
@@ -70,6 +73,7 @@ impl SharingPage {
             busy: HashSet::new(),
             errors: HashMap::new(),
             stale: HashMap::new(),
+            busy_refusals: HashMap::new(),
             edit: None,
             amount,
             models_open: HashSet::new(),
@@ -125,6 +129,24 @@ impl SharingPage {
         }
         for key in done {
             self.stale.remove(&key);
+        }
+        let settled = |peer: &str, op: &Op| {
+            let scope = match op {
+                Op::Quota(s) | Op::Reset(s) => s,
+                _ => return None,
+            };
+            let q = sharing.get(peer)?.access.as_ref()?.outgoing.quota(scope)?;
+            Some((q.usage.used(), q.usage.window_started_at.clone()))
+        };
+        let over: Vec<(String, Op)> = self
+            .busy_refusals
+            .iter()
+            .filter(|((peer, op), then)| settled(peer, op).is_some_and(|now| &now != *then))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in over {
+            self.busy_refusals.remove(&key);
+            self.errors.remove(&key);
         }
     }
 }
@@ -183,6 +205,7 @@ impl QmtApp {
             .map(|a| a.outgoing.clone());
         self.sharing.busy.insert(key.clone());
         self.sharing.errors.remove(&key);
+        self.sharing.busy_refusals.remove(&key);
         let task = self
             .store
             .update(cx, |s, cx| s.write_peer_sharing(agent, peer, write, cx));
@@ -214,6 +237,24 @@ impl QmtApp {
                             .insert(key.clone(), AccessError::Conflict.message());
                         if let Some(before) = before {
                             this.sharing.stale.insert(key, before);
+                        }
+                    }
+                    Err(err @ AccessError::InFlight(_)) => {
+                        let usage = before.as_ref().and_then(|o| match &key.1 {
+                            Op::Quota(s) | Op::Reset(s) => o
+                                .quota(s)
+                                .map(|q| (q.usage.used(), q.usage.window_started_at.clone())),
+                            _ => None,
+                        });
+                        if let Some(usage) = usage {
+                            this.sharing.busy_refusals.insert(key.clone(), usage);
+                        }
+                        this.sharing.errors.insert(key.clone(), err.message());
+                        // Show the reservation that is holding it.
+                        if let Some(agent) = this.store.read(cx).primary_agent() {
+                            let peer = key.0.clone();
+                            this.store
+                                .update(cx, |s, cx| s.load_peer_sharing(&agent, &peer, cx));
                         }
                     }
                     Err(err) => {
@@ -340,6 +381,7 @@ impl QmtApp {
                     name: node
                         .map(|n| n.label.clone())
                         .filter(|l| !l.is_empty())
+                        .or_else(|| rt.peer_labels.get(&id).cloned())
                         .unwrap_or_else(|| short_peer(&id)),
                     active_sessions: node.map_or(0, |n| n.active_sessions),
                     sharing: rt.sharing.get(&id).cloned().unwrap_or_default(),
@@ -502,7 +544,10 @@ impl QmtApp {
                             .min_w_0()
                             .text_xs()
                             .text_color(p.muted)
-                            .child(div().font_family(kit::MONO).child(short_peer(&peer.id)))
+                            // The title is the ID when no name is known.
+                            .when(peer.name != short_peer(&peer.id), |el| {
+                                el.child(div().font_family(kit::MONO).child(short_peer(&peer.id)))
+                            })
                             .child(kit::copy_button(
                                 kit::keyed("copy-node", peer.id.clone()),
                                 peer.id.clone(),
@@ -844,9 +889,14 @@ impl QmtApp {
             let grant = d.grant.clone();
             h_flex()
                 .gap_2()
-                .child(subtle_text(p).flex_1().min_w_0().child(
-                    problem.unwrap_or_else(|| format!("Now: {}", access::grant_summary(&d.base))),
-                ))
+                .child(
+                    subtle_text(p)
+                        .flex_1()
+                        .min_w_0()
+                        .child(problem.unwrap_or_else(|| {
+                            format!("Saved now: {}", access::grant_summary(&saved.grant))
+                        })),
+                )
                 .child(
                     kit::flat_btn(kit::keyed("discard", peer.id.clone()), !saving, true, p)
                         .child("Discard")
@@ -1194,7 +1244,7 @@ impl QmtApp {
                 &access.outgoing,
                 scope,
                 true,
-                "All models",
+                limit_label("Provider limit", p),
                 p,
                 window,
                 cx,
@@ -1237,7 +1287,7 @@ impl QmtApp {
                             .child(if models_open {
                                 "Hide models"
                             } else {
-                                "Limits per model"
+                                "Limit single models"
                             })
                             .child(kit::icon(
                                 if models_open {
@@ -1258,67 +1308,80 @@ impl QmtApp {
                 })
         });
 
-        let model_rows = (on && models_open).then(|| {
+        // Models with a limit stay in view even while the list is closed.
+        let limited = |model: &str| {
+            access
+                .outgoing
+                .quota(&QuotaScope::model(&pid, model))
+                .is_some_and(|q| q.limit != QuotaLimit::Unlimited)
+        };
+        let any_limited = provider.models.iter().any(|m| limited(&m.model_id));
+        let model_rows = (on && (models_open || any_limited)).then(|| {
             let selected: Vec<String> = match &selection {
                 Some(ModelSelection::Selected { model_ids }) => model_ids.clone(),
                 _ => Vec::new(),
             };
             let mut rows = Vec::new();
             for m in &provider.models {
+                if !models_open && !limited(&m.model_id) {
+                    continue;
+                }
                 let picked = all || selected.contains(&m.model_id);
                 let (t_peer, t_pid, t_model) = (peer.id.clone(), pid.clone(), m.model_id.clone());
-                let row = v_flex()
-                    .gap_1()
-                    .py_1p5()
+                // One line: the model (with its checkbox when choosing),
+                // then its limit.
+                let name = h_flex()
+                    .id(kit::keyed(
+                        "model",
+                        format!("{}/{pid}/{}", peer.id, m.model_id),
+                    ))
+                    .w(px(190.))
+                    .flex_none()
+                    .gap_2()
+                    .when(!all && !saving, |el| {
+                        el.cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit_draft(&t_peer, cx, |d| d.toggle_model(&t_pid, &t_model));
+                            }))
+                    })
+                    .when(!all, |el| {
+                        el.child(kit::icon(
+                            if picked {
+                                IconName::SquareCheckBig
+                            } else {
+                                IconName::Square
+                            },
+                            14.,
+                            if picked { p.accent } else { p.muted },
+                        ))
+                    })
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(kit::MONO)
+                            .text_xs()
+                            .text_color(if picked { p.text } else { p.muted })
+                            .child(m.model_id.clone()),
+                    );
+                let row = div()
+                    .py_1()
                     .border_t_1()
                     .border_color(divider)
-                    .child(
-                        h_flex()
-                            .id(kit::keyed(
-                                "model",
-                                format!("{}/{pid}/{}", peer.id, m.model_id),
-                            ))
-                            .gap_2()
-                            .text_sm()
-                            .when(!all && !saving, |el| {
-                                el.cursor_pointer()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.edit_draft(&t_peer, cx, |d| {
-                                            d.toggle_model(&t_pid, &t_model)
-                                        });
-                                    }))
-                            })
-                            .when(!all, |el| {
-                                el.child(kit::icon(
-                                    if picked {
-                                        IconName::SquareCheckBig
-                                    } else {
-                                        IconName::Square
-                                    },
-                                    14.,
-                                    if picked { p.accent } else { p.muted },
-                                ))
-                            })
-                            .child(
-                                div()
-                                    .font_family(kit::MONO)
-                                    .text_xs()
-                                    .text_color(if picked { p.text } else { p.muted })
-                                    .child(m.model_id.clone()),
-                            ),
-                    )
-                    .when(picked, |el| {
-                        el.child(self.quota_line(
+                    .child(if picked {
+                        self.quota_line(
                             agent,
                             peer,
                             &access.outgoing,
                             QuotaScope::model(&pid, &m.model_id),
                             m.finite_quota_supported,
-                            "This model",
+                            name.into_any_element(),
                             p,
                             window,
                             cx,
-                        ))
+                        )
+                    } else {
+                        h_flex().min_h(px(28.)).child(name).into_any_element()
                     });
                 rows.push(row);
             }
@@ -1373,7 +1436,7 @@ impl QmtApp {
         outgoing: &Outgoing,
         scope: QuotaScope,
         finite_supported: bool,
-        label: &'static str,
+        label: impl IntoElement,
         p: &Palette,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1396,13 +1459,25 @@ impl QmtApp {
         let finite = quota
             .as_ref()
             .is_some_and(|q| matches!(q.limit, QuotaLimit::Finite { .. }));
+        // Busy is not a failure: a calm note, not red.
+        let waiting = self.sharing.busy_refusals.contains_key(&set_key)
+            || self.sharing.busy_refusals.contains_key(&reset_key);
+        let tone = if waiting { p.warn } else { p.danger };
         let error_el = error.map(|e| {
             h_flex()
                 .gap_1p5()
                 .items_start()
                 .text_xs()
-                .text_color(p.danger)
-                .child(kit::icon(IconName::CircleAlert, 12., p.danger))
+                .text_color(tone)
+                .child(kit::icon(
+                    if waiting {
+                        IconName::Hourglass
+                    } else {
+                        IconName::CircleAlert
+                    },
+                    12.,
+                    tone,
+                ))
                 .child(div().flex_1().min_w_0().whitespace_normal().child(e))
         });
         if editing {
@@ -1416,14 +1491,7 @@ impl QmtApp {
         let line = h_flex()
             .gap_2()
             .min_h(px(28.))
-            .child(
-                div()
-                    .w(px(76.))
-                    .flex_none()
-                    .text_xs()
-                    .text_color(p.dim)
-                    .child(label),
-            )
+            .child(label)
             .child(match &quota {
                 Some(q) if finite => {
                     let fraction = access::usage_fraction(q).unwrap_or(0.);
@@ -1655,7 +1723,7 @@ impl QmtApp {
                             }),
                     )
                     .child(
-                        kit::accent_btn(kit::keyed("quota-save", key.clone()), !busy && parsed.is_ok(), true, p)
+                        kit::soft_accent_btn(kit::keyed("quota-save", key.clone()), !busy && parsed.is_ok(), p)
                             .child(if busy { "Saving…" } else { "Save limit" })
                             .when(!busy && parsed.is_ok(), |el| {
                                 el.on_click(cx.listener(|this, _, _, cx| this.save_quota(cx)))
@@ -1717,28 +1785,24 @@ impl QmtApp {
         };
         let mut rows = Vec::new();
         for q in idle {
-            let label = if q.scope.model_id.is_some() {
-                "Model"
-            } else {
-                "Provider"
-            };
-            let scope_label = q.scope.label();
-            rows.push(
-                v_flex()
-                    .gap_0p5()
-                    .child(div().text_xs().font_medium().child(scope_label))
-                    .child(self.quota_line(
-                        agent,
-                        peer,
-                        &access.outgoing,
-                        q.scope,
-                        true,
-                        label,
-                        p,
-                        window,
-                        cx,
-                    )),
-            );
+            let label = div()
+                .w(px(190.))
+                .flex_none()
+                .truncate()
+                .text_xs()
+                .text_color(p.muted)
+                .child(q.scope.label());
+            rows.push(self.quota_line(
+                agent,
+                peer,
+                &access.outgoing,
+                q.scope,
+                true,
+                label,
+                p,
+                window,
+                cx,
+            ));
         }
         Some(
             v_flex()
@@ -1843,4 +1907,191 @@ fn incoming_view(peer: &PeerView, access: &PeerAccess, p: &Palette) -> Div {
         ))),
     };
     v_flex().gap_2().child(title).child(body)
+}
+
+/// Label column of a limit line.
+fn limit_label(text: &'static str, p: &Palette) -> Div {
+    div()
+        .w(px(190.))
+        .flex_none()
+        .text_xs()
+        .text_color(p.dim)
+        .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::super::{Page, QmtApp};
+    use super::Op;
+    use crate::store::mesh_access::{GET, PeerGrant, SET_ACCESS, Write};
+
+    struct Harness {
+        handle: gpui_kit::AnyWindowHandle,
+        app: gpui_kit::Entity<QmtApp>,
+        rpc: std::rc::Rc<crate::rpc::RpcClient>,
+        requests: async_channel::Receiver<String>,
+    }
+
+    impl Harness {
+        fn next(&self) -> Value {
+            serde_json::from_str(&self.requests.try_recv().expect("a request")).unwrap()
+        }
+
+        fn reply(&self, request: &Value, body: Value, cx: &mut gpui_kit::TestAppContext) {
+            let mut message = json!({ "id": request["id"] });
+            if body.get("code").is_some() {
+                message["error"] = body;
+            } else {
+                message["result"] = body;
+            }
+            self.rpc.handle(&message.to_string());
+            cx.run_until_parked();
+        }
+
+        fn render(&self, cx: &mut gpui_kit::TestAppContext) {
+            use gpui_kit::AppContext as _;
+            use gpui_kit::test::TestWindowExt as _;
+            cx.update_window(self.handle, |_, window, cx| window.render_frame(cx))
+                .unwrap();
+        }
+    }
+
+    fn access(revision: &str, grant: Value) -> Value {
+        json!({
+            "version": 1, "peer_id": "thor-id",
+            "outgoing": { "revision": revision, "grant": grant, "quotas": [] },
+            "incoming": { "status": "unavailable" },
+            "shareable_catalog": [{ "provider_id": "codex", "models": [
+                { "model_id": "gpt-6.2-sol", "finite_quota_supported": true } ] }]
+        })
+    }
+
+    /// The Mesh page of an agent with mesh access v1 and one peer, `thor`,
+    /// whose sharing has loaded (No access, revision `r1`) and is open.
+    fn harness(cx: &mut gpui_kit::TestAppContext) -> Harness {
+        use gpui_kit::AppContext as _;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::theme::apply(true, "orange", cx);
+        });
+        let mut store = crate::store::launch::peer_fixture();
+        let (rpc, requests) = store.rpc_for_test("test-agent");
+        store.runtime_mut_for_test("test-agent").capabilities = Some(json!({
+            "features": { "mesh": true },
+            "mesh_access_version": 1,
+            "methods": [GET, SET_ACCESS],
+        }));
+        let (handle, app) = cx.update(|cx| {
+            let store = cx.new(|_| store);
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| QmtApp::new(store, window, cx))
+            })
+            .unwrap()
+        });
+        let h = Harness {
+            handle,
+            app,
+            rpc,
+            requests,
+        };
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.page = Page::Mesh;
+                app.sharing.open = Some("thor-id".into());
+                app.store
+                    .update(cx, |s, cx| s.load_peer_sharing("test-agent", "thor-id", cx));
+            })
+        });
+        cx.run_until_parked();
+        let read = h.next();
+        assert_eq!(read["method"], "_querymt/mesh/getPeerAccess");
+        h.reply(&read, access("r1", json!({ "mode": "none" })), cx);
+        h.render(cx);
+        h
+    }
+
+    #[gpui_kit::test]
+    fn full_access_needs_the_shell_acknowledgement(cx: &mut gpui_kit::TestAppContext) {
+        let h = harness(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.edit_draft("thor-id", cx, |d| d.set_mode("full"));
+                let draft = &app.sharing.drafts["thor-id"];
+                assert!(!draft.can_save(), "not before the acknowledgement");
+                app.edit_draft("thor-id", cx, |d| d.full_ack = true);
+                assert!(app.sharing.drafts["thor-id"].can_save());
+            })
+        });
+        h.render(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                let grant = app.sharing.drafts["thor-id"].grant.clone();
+                app.sharing_write("test-agent", "thor-id", Op::Grant, Write::Grant(grant), cx);
+            })
+        });
+        cx.run_until_parked();
+        let write = h.next();
+        assert_eq!(write["method"], "_querymt/mesh/setPeerAccess");
+        assert_eq!(write["params"]["expected_revision"], "r1");
+        assert_eq!(write["params"]["grant"], json!({ "mode": "full" }));
+        h.reply(
+            &write,
+            json!({ "version": 1, "peer_id": "thor-id", "outgoing": {
+                "revision": "r2", "grant": { "mode": "full" }, "quotas": [] } }),
+            cx,
+        );
+        h.render(cx);
+        cx.update(|cx| {
+            let app = h.app.read(cx);
+            assert!(app.sharing.drafts.is_empty(), "saved: the draft is gone");
+            let saved = app
+                .store
+                .read(cx)
+                .peer_sharing("test-agent", "thor-id")
+                .and_then(|s| s.access.clone())
+                .unwrap();
+            assert_eq!(saved.outgoing.grant, PeerGrant::Full);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_stale_save_shows_what_changed(cx: &mut gpui_kit::TestAppContext) {
+        let h = harness(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.edit_draft("thor-id", cx, |d| d.set_mode("custom"));
+                app.edit_draft("thor-id", cx, |d| d.set_sessions(true));
+                let grant = app.sharing.drafts["thor-id"].grant.clone();
+                app.sharing_write("test-agent", "thor-id", Op::Grant, Write::Grant(grant), cx);
+            })
+        });
+        cx.run_until_parked();
+        let write = h.next();
+        h.reply(
+            &write,
+            json!({ "code": -32000, "message": "grant revision changed", "data": {
+                "code": "mesh_access_conflict", "expected_revision": "r1", "actual_revision": "r9" } }),
+            cx,
+        );
+        // Another client granted Full meanwhile: read back, never retried.
+        let read = h.next();
+        assert_eq!(read["method"], "_querymt/mesh/getPeerAccess");
+        h.reply(&read, access("r9", json!({ "mode": "full" })), cx);
+        h.render(cx);
+        assert!(h.requests.try_recv().is_err(), "no automatic retry");
+        cx.update(|cx| {
+            let app = h.app.read(cx);
+            let draft = &app.sharing.drafts["thor-id"];
+            assert_eq!(
+                draft.changed_elsewhere,
+                vec!["Access changed from No access to Full access."]
+            );
+            assert!(!draft.can_save(), "the owner decides first");
+            let error = &app.sharing.errors[&("thor-id".to_string(), Op::Grant)];
+            assert!(error.starts_with("Not saved: sharing for this peer changed elsewhere."));
+            assert!(error.contains("No access to Full access"));
+        });
+    }
 }
