@@ -475,7 +475,7 @@ impl QmtApp {
         let (log_view, log_sub) = log_view::LogView::new(window, cx);
         subs.push(log_sub);
         let sharing = mesh_sharing::SharingPage::new(window, cx);
-        subs.push(sharing.subscribe(window, cx));
+        subs.extend(sharing.subscribe(window, cx));
         let mut this = Self {
             store,
             page,
@@ -1192,6 +1192,11 @@ impl Render for QmtApp {
                     .flatten()
             })
             .or_else(|| self.render_model_modal(radii, cx))
+            .or_else(|| {
+                (self.page == Page::Mesh)
+                    .then(|| self.render_share_models_modal(radii, cx))
+                    .flatten()
+            })
             .or_else(|| self.render_automation_overlay(radii, cx))
             .or_else(|| self.render_workspace_overlay(radii, cx))
             .or_else(|| self.render_overlay(radii, cx));

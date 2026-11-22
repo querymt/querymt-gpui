@@ -62,13 +62,15 @@ pub(super) struct SharingPage {
     busy_refusals: HashMap<(String, Op), (u64, Option<String>)>,
     edit: Option<QuotaEdit>,
     amount: Entity<InputState>,
-    /// `peer/provider` rows with their model list open.
-    models_open: HashSet<String>,
+    /// The model picker that is open: `(peer, provider)`.
+    models_modal: Option<(String, String)>,
+    models_query: Entity<InputState>,
 }
 
 impl SharingPage {
     pub(super) fn new(window: &mut Window, cx: &mut Context<QmtApp>) -> Self {
         let amount = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. 2.5"));
+        let models_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
         Self {
             open: None,
             drafts: HashMap::new(),
@@ -78,26 +80,42 @@ impl SharingPage {
             busy_refusals: HashMap::new(),
             edit: None,
             amount,
-            models_open: HashSet::new(),
+            models_modal: None,
+            models_query,
         }
     }
 
-    /// Enter saves the limit being edited.
-    pub(super) fn subscribe(&self, window: &mut Window, cx: &mut Context<QmtApp>) -> Subscription {
-        cx.subscribe_in(
-            &self.amount,
-            window,
-            |this, _, ev: &InputEvent, _, cx| match ev {
-                InputEvent::PressEnter { .. } => this.save_quota(cx),
-                InputEvent::Change => cx.notify(),
-                _ => {}
-            },
-        )
+    /// Enter saves the limit being edited; the model search filters as typed.
+    pub(super) fn subscribe(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<QmtApp>,
+    ) -> Vec<Subscription> {
+        vec![
+            cx.subscribe_in(
+                &self.amount,
+                window,
+                |this, _, ev: &InputEvent, _, cx| match ev {
+                    InputEvent::PressEnter { .. } => this.save_quota(cx),
+                    InputEvent::Change => cx.notify(),
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &self.models_query,
+                window,
+                |_, _, ev: &InputEvent, _, cx| {
+                    if matches!(ev, InputEvent::Change) {
+                        cx.notify()
+                    }
+                },
+            ),
+        ]
     }
 
-    /// Escape: close the limit editor.
+    /// Escape: close the model picker, else the limit editor.
     pub(super) fn close_editor(&mut self) -> bool {
-        self.edit.take().is_some()
+        self.models_modal.take().is_some() || self.edit.take().is_some()
     }
 
     /// Follow what the agent now has saved: drafts rebase or show a change
@@ -987,37 +1005,145 @@ impl QmtApp {
             .children(idle_limits)
     }
 
-    /// A labelled switch row inside the editor.
-    #[allow(clippy::too_many_arguments)]
-    fn toggle_row(
+    /// Sessions, Files and Shell as one row of pills: each needs the one
+    /// before it, so they read as a ladder.
+    fn capability_row(
         &self,
-        id: ElementId,
-        icon: IconName,
-        title: &'static str,
-        help: String,
-        on: bool,
-        enabled: bool,
+        peer: &PeerView,
+        (sessions, filesystem, shell): (bool, bool, bool),
+        saving: bool,
         p: &Palette,
         cx: &mut Context<Self>,
-        handler: impl Fn(&mut Self, bool, &mut Context<Self>) + 'static,
     ) -> Div {
-        h_flex()
-            .gap_3()
-            .child(kit::icon(icon, 15., if on { p.text } else { p.muted }))
+        let pill = |this: &Self,
+                    name: &'static str,
+                    icon: IconName,
+                    title: &'static str,
+                    on: bool,
+                    cx: &mut Context<Self>,
+                    set: fn(&mut GrantDraft, bool)| {
+            let id = peer.id.clone();
+            let _ = this;
+            kit::toggle_chip(kit::keyed(name, peer.id.clone()), on, !saving, p)
+                .child(kit::icon(icon, 13., if on { p.accent } else { p.muted }))
+                .child(title)
+                .when(on, |el| el.child(kit::icon(IconName::Check, 12., p.accent)))
+                .when(!saving, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit_draft(&id, cx, |d| set(d, !on));
+                    }))
+                })
+        };
+        let summary = match (sessions, filesystem, shell) {
+            (false, _, _) => {
+                "Nothing yet: the peer can only use models you share below.".to_string()
+            }
+            (true, false, _) => format!(
+                "{} can list, open, start and prompt sessions here.",
+                peer.name
+            ),
+            (true, true, false) => format!(
+                "{} can run sessions and change files inside their workspace.",
+                peer.name
+            ),
+            (true, true, true) => format!(
+                "{} can run sessions, change workspace files, and use the unsandboxed shell.",
+                peer.name
+            ),
+        };
+        v_flex()
+            .gap_1p5()
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_sm().font_medium().child(title))
-                    .child(subtle_text(p).child(help)),
+                h_flex()
+                    .gap_1p5()
+                    .flex_wrap()
+                    .child(pill(
+                        self,
+                        "share-sessions",
+                        IconName::MessagesSquare,
+                        "Sessions",
+                        sessions,
+                        cx,
+                        GrantDraft::set_sessions,
+                    ))
+                    .child(pill(
+                        self,
+                        "share-files",
+                        IconName::Folder,
+                        "Files",
+                        filesystem,
+                        cx,
+                        GrantDraft::set_filesystem,
+                    ))
+                    .child(pill(
+                        self,
+                        "share-shell",
+                        IconName::SquareTerminal,
+                        "Shell",
+                        shell,
+                        cx,
+                        GrantDraft::set_shell,
+                    )),
             )
-            .child(
-                kit::switch(id)
-                    .checked(on)
-                    .small()
-                    .disabled(!enabled)
-                    .on_click(cx.listener(move |this, v: &bool, _, cx| handler(this, *v, cx))),
-            )
+            .child(subtle_text(p).whitespace_normal().child(summary))
+    }
+
+    /// "Add provider": a menu of the catalog providers not shared yet.
+    fn add_provider_menu(
+        &self,
+        peer: &PeerView,
+        available: &[&ShareableProvider],
+        order: &[String],
+        saving: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let enabled = !saving && !available.is_empty();
+        let trigger = kit::flat_menu_btn(
+            kit::keyed("add-provider", peer.id.clone()),
+            "Add provider",
+            p,
+            cx,
+        )
+        .icon(IconName::Plus);
+        if !enabled {
+            return trigger
+                .inactive(true)
+                .when(available.is_empty() && !saving, |b| {
+                    b.tooltip("Every provider on this machine is shared already.")
+                })
+                .into_any_element();
+        }
+        let app = cx.entity().downgrade();
+        let peer_id = peer.id.clone();
+        let order = order.to_vec();
+        let items: Vec<(String, usize)> = available
+            .iter()
+            .map(|c| (c.provider_id.clone(), c.models.len()))
+            .collect();
+        trigger
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                for (pid, count) in &items {
+                    let (app, peer_id, order, id) =
+                        (app.clone(), peer_id.clone(), order.clone(), pid.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(format!(
+                            "{pid}  ·  {count} model{}",
+                            if *count == 1 { "" } else { "s" }
+                        ))
+                        .on_click(move |_, _, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.edit_draft(&peer_id, cx, |d| {
+                                    d.set_provider(&id, true, &order)
+                                });
+                            });
+                        }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1027,7 +1153,7 @@ impl QmtApp {
         peer: &PeerView,
         access: &PeerAccess,
         grant: &PeerGrant,
-        (sessions, filesystem, shell): (bool, bool, bool),
+        capabilities: (bool, bool, bool),
         saving: bool,
         p: &Palette,
         window: &mut Window,
@@ -1035,105 +1161,119 @@ impl QmtApp {
     ) -> AnyElement {
         let catalog: Vec<ShareableProvider> = access.shareable_catalog.clone().unwrap_or_default();
         let order: Vec<String> = catalog.iter().map(|c| c.provider_id.clone()).collect();
-        let (s_id, f_id, x_id) = (peer.id.clone(), peer.id.clone(), peer.id.clone());
-        let toggles = v_flex()
-            .gap_3()
-            .child(self.toggle_row(
-                kit::keyed("share-sessions", peer.id.clone()),
-                IconName::MessagesSquare,
-                "Sessions",
-                format!(
-                    "{} can list, open, start and prompt sessions here.",
-                    peer.name
-                ),
-                sessions,
-                !saving,
-                p,
-                cx,
-                move |this, v, cx| this.edit_draft(&s_id, cx, |d| d.set_sessions(v)),
-            ))
-            .child(self.toggle_row(
-                kit::keyed("share-files", peer.id.clone()),
-                IconName::Folder,
-                "Files",
-                "Read and change files inside a session's workspace, nowhere else.".into(),
-                filesystem,
-                !saving,
-                p,
-                cx,
-                move |this, v, cx| this.edit_draft(&f_id, cx, |d| d.set_filesystem(v)),
-            ))
-            .child(self.toggle_row(
-                kit::keyed("share-shell", peer.id.clone()),
-                IconName::SquareTerminal,
-                "Shell",
-                "Allows the unsandboxed shell.".into(),
-                shell,
-                !saving,
-                p,
-                cx,
-                move |this, v, cx| this.edit_draft(&x_id, cx, |d| d.set_shell(v)),
-            ));
+        let caps = self.capability_row(peer, capabilities, saving, p, cx);
 
-        // Providers the grant names that this machine no longer offers.
-        let missing: Vec<String> = match grant {
-            PeerGrant::Custom { providers, .. } => providers
-                .iter()
-                .map(|pg| pg.provider_id.clone())
-                .filter(|id| !order.contains(id))
-                .collect(),
+        let shared_ids: Vec<String> = match grant {
+            PeerGrant::Custom { providers, .. } => {
+                providers.iter().map(|pg| pg.provider_id.clone()).collect()
+            }
             _ => Vec::new(),
         };
-        let models = v_flex()
-            .gap_2()
+        // Providers the grant names that this machine no longer offers.
+        let missing: Vec<String> = shared_ids
+            .iter()
+            .filter(|id| !order.contains(id))
+            .cloned()
+            .collect();
+        let available: Vec<&ShareableProvider> = catalog
+            .iter()
+            .filter(|c| !shared_ids.contains(&c.provider_id))
+            .collect();
+        let shared: Vec<&ShareableProvider> = catalog
+            .iter()
+            .filter(|c| shared_ids.contains(&c.provider_id))
+            .collect();
+        let header = h_flex()
+            .gap_3()
+            .items_start()
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_w_0()
                     .child(div().text_sm().font_medium().child("Models"))
                     .child(subtle_text(p).child(format!(
                         "Providers set up on this machine that {} may use.",
                         peer.name
                     ))),
             )
-            .when(catalog.is_empty(), |el| {
-                el.child(
-                    subtle_text(p)
+            .when(!catalog.is_empty(), |el| {
+                el.child(self.add_provider_menu(peer, &available, &order, saving, p, cx))
+            });
+        let (divider, _) = kit::subtle(p);
+        let list: AnyElement = if catalog.is_empty() {
+            subtle_text(p)
+                .px_3()
+                .py_2()
+                .rounded(px(8.))
+                .bg(p.chip)
+                .child("This machine has no models to share yet. Set up a provider in Settings → Providers.")
+                .into_any_element()
+        } else if shared.is_empty() && missing.is_empty() {
+            subtle_text(p)
+                .px_3()
+                .py_2()
+                .rounded(px(8.))
+                .bg(p.chip)
+                .child(format!(
+                    "No providers shared yet: {} cannot use any model here. Add one above.",
+                    peer.name
+                ))
+                .into_any_element()
+        } else {
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for (ix, provider) in shared.iter().enumerate() {
+                rows.push(
+                    self.provider_row(
+                        agent, peer, access, grant, provider, &order, saving, p, window, cx,
+                    )
+                    .when(ix > 0, |el| el.border_t_1().border_color(divider))
+                    .into_any_element(),
+                );
+            }
+            for id in missing {
+                let (pid, order) = (peer.id.clone(), order.clone());
+                rows.push(
+                    h_flex()
+                        .gap_2()
                         .px_3()
                         .py_2()
-                        .rounded(px(8.))
-                        .bg(p.chip)
-                        .child("This machine has no models to share yet. Set up a provider in Settings → Providers."),
-                )
-            })
-            .children(catalog.iter().map(|provider| {
-                self.provider_row(agent, peer, access, grant, provider, &order, saving, p, window, cx)
-                    .into_any_element()
-            }))
-            .children(missing.into_iter().map(|id| {
-                let (pid, order) = (peer.id.clone(), order.clone());
-                h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(p.warn)
-                    .child(kit::icon(IconName::TriangleAlert, 12., p.warn))
-                    .child(div().flex_1().child(format!(
-                        "{id} is shared but not available on this machine right now."
-                    )))
-                    .child(
-                        kit::flat_btn(kit::keyed("drop-provider", format!("{pid}-{id}")), true, true, p)
+                        .text_xs()
+                        .text_color(p.warn)
+                        .when(!rows.is_empty(), |el| el.border_t_1().border_color(divider))
+                        .child(kit::icon(IconName::TriangleAlert, 12., p.warn))
+                        .child(div().flex_1().child(format!(
+                            "{id} is shared but not available on this machine right now."
+                        )))
+                        .child(
+                            kit::flat_btn(
+                                kit::keyed("drop-provider", format!("{pid}-{id}")),
+                                true,
+                                true,
+                                p,
+                            )
                             .child("Stop sharing it")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit_draft(&pid, cx, |d| d.set_provider(&id, false, &order));
-                            })),
-                    )
-                    .into_any_element()
-            }));
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.edit_draft(&pid, cx, |d| {
+                                        d.set_provider(&id, false, &order)
+                                    });
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                );
+            }
+            kit::card(p).children(rows).into_any_element()
+        };
         v_flex()
             .gap_4()
-            .child(toggles)
-            .child(models)
+            .child(caps)
+            .child(v_flex().gap_2().child(header).child(list))
             .into_any_element()
     }
 
+    /// One shared provider: its name, which models, its limit, and the
+    /// limits of single models underneath.
     #[allow(clippy::too_many_arguments)]
     fn provider_row(
         &mut self,
@@ -1148,235 +1288,470 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
         let (divider, _) = kit::subtle(p);
         let pid = provider.provider_id.clone();
-        let selection = shared(grant, &pid).cloned();
-        let on = selection.is_some();
-        let list_key = format!("{}/{pid}", peer.id);
-        let all = matches!(selection, Some(ModelSelection::All));
-        let models_open = self.sharing.models_open.contains(&list_key) || (on && !all);
+        let selection = shared(grant, &pid).cloned().unwrap_or(ModelSelection::All);
         let count = provider.models.len();
-        let (toggle_peer, toggle_pid, toggle_order) =
-            (peer.id.clone(), pid.clone(), order.to_vec());
+        let all = matches!(selection, ModelSelection::All);
+        let picked: Vec<String> = match &selection {
+            ModelSelection::All => provider.models.iter().map(|m| m.model_id.clone()).collect(),
+            ModelSelection::Selected { model_ids } => model_ids.clone(),
+        };
+        let models_label = match &selection {
+            ModelSelection::All => "All models".to_string(),
+            ModelSelection::Selected { model_ids } => {
+                format!("{} of {count} models", model_ids.len())
+            }
+        };
+        let row_key = format!("{}/{pid}", peer.id);
+        let (m_peer, m_pid) = (peer.id.clone(), pid.clone());
+        let (r_peer, r_pid, r_order) = (peer.id.clone(), pid.clone(), order.to_vec());
+        let name = h_flex()
+            .w(px(150.))
+            .flex_none()
+            .gap_2()
+            .child(kit::provider_icon(&pid, 14., p.muted))
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .truncate()
+                    .child(pid.clone()),
+            );
+        let models_btn = kit::flat_btn(
+            kit::keyed("provider-models", row_key.clone()),
+            !saving,
+            true,
+            p,
+        )
+        .child(
+            div()
+                .text_color(if all { p.text } else { p.accent })
+                .child(models_label),
+        )
+        .child(kit::icon(IconName::ChevronDown, 12., p.dim))
+        .when(!saving, |el| {
+            el.on_click(cx.listener(move |this, _, window, cx| {
+                this.open_models_modal(&m_peer, &m_pid, window, cx);
+            }))
+        });
+        let limit = self.quota_line(
+            agent,
+            peer,
+            &access.outgoing,
+            QuotaScope::provider(&pid),
+            true,
+            div().w_0(),
+            p,
+            window,
+            cx,
+        );
+        let remove = kit::row_icon_button(
+            kit::keyed("provider-remove", row_key.clone()),
+            IconName::X,
+            format!("Stop sharing {pid}"),
+            p,
+            cx,
+        )
+        .disabled(saving)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.edit_draft(&r_peer, cx, |d| d.set_provider(&r_pid, false, &r_order));
+        }));
         let head = h_flex()
             .gap_3()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().text_sm().font_semibold().child(pid.clone()))
-                    .child(subtle_text(p).child(match &selection {
-                        None => format!("Not shared · {count} models"),
-                        Some(ModelSelection::All) => {
-                            format!("All {count} models, and any added later")
-                        }
-                        Some(ModelSelection::Selected { model_ids }) => {
-                            format!("{} of {count} models", model_ids.len())
-                        }
-                    })),
-            )
-            .child(
-                kit::switch(kit::keyed("share-provider", list_key.clone()))
-                    .checked(on)
-                    .small()
-                    .disabled(saving)
-                    .on_click(cx.listener(move |this, v: &bool, _, cx| {
-                        let v = *v;
-                        this.edit_draft(&toggle_peer, cx, |d| {
-                            d.set_provider(&toggle_pid, v, &toggle_order)
-                        });
-                    })),
-            );
+            .min_h(px(44.))
+            .child(name)
+            .child(models_btn)
+            .child(div().flex_1().min_w_0().child(limit))
+            .child(remove);
 
-        let scope = QuotaScope::provider(&pid);
-        let provider_limit = on.then(|| {
-            self.quota_line(
-                agent,
-                peer,
-                &access.outgoing,
-                scope,
-                true,
-                limit_label("Provider limit", p),
-                p,
-                window,
-                cx,
-            )
-        });
-
-        let choose = on.then(|| {
-            let (all_peer, all_pid) = (peer.id.clone(), pid.clone());
-            let (some_peer, some_pid) = (peer.id.clone(), pid.clone());
-            let disclosure_key = list_key.clone();
-            h_flex()
-                .gap_2()
-                .child(
-                    kit::segment_bar(p)
-                        .child(
-                            kit::segment(kit::keyed("models-all", list_key.clone()), all, p)
-                                .label("All models")
-                                .inactive(saving)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.edit_draft(&all_peer, cx, |d| {
-                                        d.set_all_models(&all_pid, true, &[])
-                                    });
-                                })),
-                        )
-                        .child(
-                            kit::segment(kit::keyed("models-some", list_key.clone()), !all, p)
-                                .label("Choose models")
-                                .inactive(saving)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.edit_draft(&some_peer, cx, |d| {
-                                        d.set_all_models(&some_pid, false, &[])
-                                    });
-                                })),
-                        ),
-                )
-                .child(div().flex_1())
-                .when(all && count > 0, |el| {
-                    el.child(
-                        kit::flat_btn(kit::keyed("models-open", list_key.clone()), true, true, p)
-                            .child(if models_open {
-                                "Hide models"
-                            } else {
-                                "Limit single models"
-                            })
-                            .child(kit::icon(
-                                if models_open {
-                                    IconName::ChevronUp
-                                } else {
-                                    IconName::ChevronDown
-                                },
-                                13.,
-                                p.muted,
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.sharing.models_open.remove(&disclosure_key) {
-                                    this.sharing.models_open.insert(disclosure_key.clone());
-                                }
-                                cx.notify();
-                            })),
-                    )
-                })
-        });
-
-        // Models with a limit stay in view even while the list is closed.
+        // Single-model limits: only the models that have one, plus a menu to
+        // add one for any other model the peer may use.
         let limited = |model: &str| {
             access
                 .outgoing
                 .quota(&QuotaScope::model(&pid, model))
                 .is_some_and(|q| q.limit != QuotaLimit::Unlimited)
         };
-        let any_limited = provider.models.iter().any(|m| limited(&m.model_id));
-        let model_rows = (on && (models_open || any_limited)).then(|| {
-            let selected: Vec<String> = match &selection {
-                Some(ModelSelection::Selected { model_ids }) => model_ids.clone(),
-                _ => Vec::new(),
-            };
-            let mut rows = Vec::new();
-            for m in &provider.models {
-                if !models_open && !limited(&m.model_id) {
-                    continue;
+        let editing_model = self.sharing.edit.as_ref().and_then(|e| {
+            (e.peer == peer.id && e.scope.provider_id == pid)
+                .then(|| e.scope.model_id.clone())
+                .flatten()
+        });
+        let mut model_lines: Vec<AnyElement> = Vec::new();
+        for m in &provider.models {
+            if !limited(&m.model_id) && editing_model.as_deref() != Some(m.model_id.as_str()) {
+                continue;
+            }
+            let label = div()
+                .w(px(190.))
+                .flex_none()
+                .min_w_0()
+                .truncate()
+                .font_family(kit::MONO)
+                .text_xs()
+                .text_color(if picked.contains(&m.model_id) {
+                    p.text
+                } else {
+                    p.muted
+                })
+                .child(m.model_id.clone());
+            model_lines.push(self.quota_line(
+                agent,
+                peer,
+                &access.outgoing,
+                QuotaScope::model(&pid, &m.model_id),
+                m.finite_quota_supported,
+                label,
+                p,
+                window,
+                cx,
+            ));
+        }
+        let limitable: Vec<String> = provider
+            .models
+            .iter()
+            .filter(|m| {
+                m.finite_quota_supported && picked.contains(&m.model_id) && !limited(&m.model_id)
+            })
+            .map(|m| m.model_id.clone())
+            .collect();
+        let add_limit = (!limitable.is_empty() && !saving).then(|| {
+            let app = cx.entity().downgrade();
+            let (peer_id, pid) = (peer.id.clone(), pid.clone());
+            kit::flat_menu_btn(
+                kit::keyed("limit-model", row_key.clone()),
+                "Limit a model",
+                p,
+                cx,
+            )
+            .icon(IconName::Gauge)
+            .h(px(26.))
+            .text_size(px(11.5))
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                for model in &limitable {
+                    let (app, peer_id, scope) =
+                        (app.clone(), peer_id.clone(), QuotaScope::model(&pid, model));
+                    menu = menu.item(PopupMenuItem::new(model.clone()).on_click(
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.open_quota_editor(&peer_id, scope.clone(), None, window, cx)
+                            });
+                        },
+                    ));
                 }
-                let picked = all || selected.contains(&m.model_id);
-                let (t_peer, t_pid, t_model) = (peer.id.clone(), pid.clone(), m.model_id.clone());
-                // One line: the model (with its checkbox when choosing),
-                // then its limit.
-                let name = h_flex()
-                    .id(kit::keyed(
-                        "model",
-                        format!("{}/{pid}/{}", peer.id, m.model_id),
-                    ))
-                    .w(px(190.))
-                    .flex_none()
-                    .gap_2()
-                    .when(!all && !saving, |el| {
+                menu
+            })
+        });
+        // Chosen models this machine no longer lists.
+        let gone: Vec<String> = match &selection {
+            ModelSelection::Selected { model_ids } => model_ids
+                .iter()
+                .filter(|s| !provider.models.iter().any(|m| &m.model_id == *s))
+                .cloned()
+                .collect(),
+            ModelSelection::All => Vec::new(),
+        };
+        let details =
+            (!model_lines.is_empty() || add_limit.is_some() || !gone.is_empty()).then(|| {
+                v_flex()
+                    .pl(px(162.))
+                    .pb_2()
+                    .gap_1()
+                    .children(model_lines)
+                    .children(gone.into_iter().map(|g| {
+                        let (t_peer, t_pid, t_model) = (peer.id.clone(), pid.clone(), g.clone());
+                        h_flex()
+                            .id(kit::keyed("model-gone", format!("{row_key}/{g}")))
+                            .gap_2()
+                            .text_xs()
+                            .cursor_pointer()
+                            .child(kit::icon(IconName::TriangleAlert, 12., p.warn))
+                            .child(div().font_family(kit::MONO).child(g))
+                            .child(
+                                div()
+                                    .text_color(p.warn)
+                                    .child("not available here now · click to drop"),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.edit_draft(&t_peer, cx, |d| d.toggle_model(&t_pid, &t_model));
+                            }))
+                    }))
+                    .children(add_limit.map(|b| h_flex().child(b)))
+            });
+        v_flex()
+            .px_3()
+            .child(head)
+            .children(details)
+            .border_color(divider)
+    }
+
+    fn open_models_modal(
+        &mut self,
+        peer: &str,
+        provider: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sharing.models_modal = Some((peer.to_string(), provider.to_string()));
+        self.sharing.models_query.update(cx, |s, cx| {
+            s.set_value(SharedString::default(), window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// The model picker of one shared provider: search, "All models", and
+    /// one checkbox row per model. Changes go into the peer's draft.
+    pub(super) fn render_share_models_modal(
+        &mut self,
+        radii: Corners<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (peer_id, pid) = self.sharing.models_modal.clone()?;
+        let p = *palette(cx);
+        let store = self.store.read(cx);
+        let agent = store.primary_agent()?;
+        let access = store.peer_sharing(&agent, &peer_id)?.access.clone()?;
+        let peer_name = store
+            .runtime(&agent)
+            .map(|rt| rt.peer_name(&peer_id))
+            .unwrap_or_else(|| short_peer(&peer_id));
+        let provider = access
+            .shareable_catalog
+            .as_ref()
+            .and_then(|c| c.iter().find(|c| c.provider_id == pid))
+            .cloned();
+        let grant = self
+            .sharing
+            .drafts
+            .get(&peer_id)
+            .map(|d| d.grant.clone())
+            .unwrap_or_else(|| access.outgoing.grant.clone());
+        let selection = shared(&grant, &pid).cloned();
+        let all = matches!(selection, Some(ModelSelection::All));
+        let picked: Vec<String> = match &selection {
+            Some(ModelSelection::Selected { model_ids }) => model_ids.clone(),
+            _ => Vec::new(),
+        };
+        let models: Vec<(String, bool)> = provider
+            .as_ref()
+            .map(|c| {
+                c.models
+                    .iter()
+                    .map(|m| (m.model_id.clone(), m.finite_quota_supported))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let count = models.len();
+        let query = self
+            .sharing
+            .models_query
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let shown: Vec<(String, bool)> = models
+            .into_iter()
+            .filter(|(m, _)| query.is_empty() || m.to_lowercase().contains(&query))
+            .collect();
+
+        let close = |this: &mut Self, cx: &mut Context<Self>| {
+            this.sharing.models_modal = None;
+            cx.notify();
+        };
+        let (a_peer, a_pid) = (peer_id.clone(), pid.clone());
+        let all_row = h_flex()
+            .id("share-models-all")
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded(px(8.))
+            .bg(p.card)
+            .cursor_pointer()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .child(div().text_sm().font_medium().child("All models"))
+                    .child(subtle_text(&p).child(format!(
+                        "Every one of the {count}, and any {pid} adds later."
+                    ))),
+            )
+            .child(
+                kit::switch("share-models-all-switch")
+                    .checked(all)
+                    .small()
+                    .on_click(cx.listener({
+                        let (peer_id, pid) = (peer_id.clone(), pid.clone());
+                        move |this, v: &bool, _, cx| {
+                            let v = *v;
+                            this.edit_draft(&peer_id, cx, |d| d.set_all_models(&pid, v, &[]));
+                        }
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.edit_draft(&a_peer, cx, |d| d.set_all_models(&a_pid, !all, &[]));
+            }));
+        let hover = p.card;
+        let rows: Vec<AnyElement> = shown
+            .iter()
+            .map(|(m, _)| {
+                let on = all || picked.contains(m);
+                let (t_peer, t_pid, t_model) = (peer_id.clone(), pid.clone(), m.clone());
+                h_flex()
+                    .id(kit::keyed("share-model", format!("{peer_id}/{pid}/{m}")))
+                    .gap_2p5()
+                    .px_3()
+                    .py_1p5()
+                    .rounded(px(8.))
+                    .when(!all, |el| {
                         el.cursor_pointer()
+                            .hover(move |s| s.bg(hover))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.edit_draft(&t_peer, cx, |d| d.toggle_model(&t_pid, &t_model));
                             }))
                     })
-                    .when(!all, |el| {
-                        el.child(kit::icon(
-                            if picked {
-                                IconName::SquareCheckBig
-                            } else {
-                                IconName::Square
-                            },
-                            14.,
-                            if picked { p.accent } else { p.muted },
-                        ))
-                    })
+                    .child(kit::icon(
+                        if on {
+                            IconName::SquareCheckBig
+                        } else {
+                            IconName::Square
+                        },
+                        15.,
+                        if all {
+                            p.dim
+                        } else if on {
+                            p.accent
+                        } else {
+                            p.muted
+                        },
+                    ))
                     .child(
                         div()
+                            .flex_1()
                             .min_w_0()
                             .truncate()
                             .font_family(kit::MONO)
-                            .text_xs()
-                            .text_color(if picked { p.text } else { p.muted })
-                            .child(m.model_id.clone()),
-                    );
-                let row = div()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(divider)
-                    .child(if picked {
-                        self.quota_line(
-                            agent,
-                            peer,
-                            &access.outgoing,
-                            QuotaScope::model(&pid, &m.model_id),
-                            m.finite_quota_supported,
-                            name.into_any_element(),
-                            p,
-                            window,
-                            cx,
-                        )
-                    } else {
-                        h_flex().min_h(px(28.)).child(name).into_any_element()
-                    });
-                rows.push(row);
-            }
-            // Chosen models this machine no longer lists.
-            for gone in selected
-                .iter()
-                .filter(|s| !provider.models.iter().any(|m| &m.model_id == *s))
-            {
-                let (t_peer, t_pid, t_model) = (peer.id.clone(), pid.clone(), gone.clone());
-                rows.push(
-                    v_flex().py_1p5().border_t_1().border_color(divider).child(
-                        h_flex()
-                            .id(kit::keyed(
-                                "model-gone",
-                                format!("{}/{pid}/{gone}", peer.id),
-                            ))
-                            .gap_2()
-                            .text_xs()
-                            .cursor_pointer()
-                            .child(kit::icon(IconName::SquareCheckBig, 14., p.warn))
-                            .child(div().font_family(kit::MONO).child(gone.clone()))
-                            .child(div().text_color(p.warn).child("not available here now"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit_draft(&t_peer, cx, |d| d.toggle_model(&t_pid, &t_model));
-                            })),
-                    ),
-                );
-            }
-            v_flex().children(rows)
-        });
-
-        v_flex()
-            .gap_2()
-            .px_3()
-            .py_2p5()
+                            .text_sm()
+                            .text_color(if all {
+                                p.muted
+                            } else if on {
+                                p.text
+                            } else {
+                                p.muted
+                            })
+                            .child(m.clone()),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let footer_text = if all {
+            format!("All {count} models")
+        } else {
+            format!("{} of {count} models", picked.len())
+        };
+        let search = h_flex()
+            .pl_2p5()
+            .pr_1()
+            .h(px(34.))
             .rounded(px(10.))
             .bg(p.card)
             .border_1()
-            .border_color(if on { divider } else { transparent_black() })
-            .child(head)
-            .children(choose)
-            .children(provider_limit)
-            .children(model_rows)
+            .border_color(p.border)
+            .child(kit::icon(IconName::Search, 15., p.dim))
+            .child(
+                Input::new(&self.sharing.models_query)
+                    .appearance(false)
+                    .flex_1(),
+            );
+        let card = v_flex()
+            .id("share-models-card")
+            .w(px(520.))
+            .max_h(px(600.))
+            .rounded(px(16.))
+            .bg(p.surface)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .px_4()
+                    .pt_4()
+                    .pb_3()
+                    .gap_3()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .child(div().font_semibold().child(format!("{pid} models for {peer_name}")))
+                            .child(div().text_xs().text_color(p.dim).child(
+                                "Which models the peer may use. Limits are set on the provider row.",
+                            )),
+                    )
+                    .child(
+                        kit::icon_button("share-models-close", IconName::X, "Close")
+                            .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
+                    ),
+            )
+            .child(v_flex().px_4().gap_2().child(all_row).child(search))
+            .child(
+                v_flex()
+                    .id("share-models-list")
+                    .flex_1()
+                    .min_h(px(220.))
+                    .overflow_y_scroll()
+                    .px_2()
+                    .py_2()
+                    .children(rows)
+                    .when(shown.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .p_6()
+                                .text_sm()
+                                .text_color(p.dim)
+                                .text_center()
+                                .child(if count == 0 {
+                                    "This provider lists no models right now."
+                                } else {
+                                    "No models match your search."
+                                }),
+                        )
+                    })
+                    .map(|el| self.smooth_scroll.region("share-models-list", el)),
+            )
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_3()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(p.border)
+                    .child(subtle_text(&p).flex_1().child(footer_text))
+                    .child(
+                        kit::flat_btn("share-models-done", true, true, &p)
+                            .child("Done")
+                            .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
+                    ),
+            );
+        Some(
+            div()
+                .id("scrim-share-models")
+                .absolute()
+                .inset_0()
+                .rounded_tl(radii.top_left)
+                .rounded_tr(radii.top_right)
+                .rounded_bl(radii.bottom_left)
+                .rounded_br(radii.bottom_right)
+                .bg(black().opacity(if p.dark { 0.55 } else { 0.28 }))
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_click(cx.listener(move |this, _, _, cx| close(this, cx)))
+                .child(card)
+                .into_any_element(),
+        )
     }
 
     /// One limit: its amount, usage and actions, or its editor.
@@ -1892,16 +2267,6 @@ fn full_warning(p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
-/// Label column of a limit line.
-fn limit_label(text: &'static str, p: &Palette) -> Div {
-    div()
-        .w(px(190.))
-        .flex_none()
-        .text_xs()
-        .text_color(p.dim)
-        .child(text)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
@@ -2087,6 +2452,48 @@ mod tests {
             let error = &app.sharing.errors[&("peer-a-id".to_string(), Op::Grant)];
             assert!(error.starts_with("Not saved: sharing for this peer changed elsewhere."));
             assert!(error.contains("No access to Full access"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn providers_are_added_and_models_picked_in_the_modal(cx: &mut gpui_kit::TestAppContext) {
+        let h = harness(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.edit_draft("peer-a-id", cx, |d| d.set_mode("custom"));
+                // Custom starts with no provider: the list shows only what is shared.
+                assert!(matches!(
+                    &app.sharing.drafts["peer-a-id"].grant,
+                    PeerGrant::Custom { providers, .. } if providers.is_empty()
+                ));
+                app.edit_draft("peer-a-id", cx, |d| {
+                    d.set_provider("codex", true, &["codex".to_string()])
+                });
+            })
+        });
+        h.render(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.sharing.models_modal = Some(("peer-a-id".into(), "codex".into()));
+                cx.notify();
+            })
+        });
+        h.render(cx);
+        cx.update(|cx| {
+            h.app.update(cx, |app, cx| {
+                app.edit_draft("peer-a-id", cx, |d| d.set_all_models("codex", false, &[]));
+                app.edit_draft("peer-a-id", cx, |d| d.toggle_model("codex", "gpt-6.2-sol"));
+                assert!(app.sharing.close_editor(), "Escape closes the picker");
+                assert!(app.sharing.models_modal.is_none());
+            })
+        });
+        h.render(cx);
+        cx.update(|cx| {
+            let app = h.app.read(cx);
+            assert_eq!(
+                crate::store::mesh_access::grant_summary(&app.sharing.drafts["peer-a-id"].grant),
+                "codex (gpt-6.2-sol)"
+            );
         });
     }
 

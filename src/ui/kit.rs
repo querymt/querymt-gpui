@@ -330,6 +330,48 @@ pub fn soft_accent_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> 
     )
 }
 
+/// A component `Button` in the [`flat_btn`] look, for the places that need
+/// a `Button` (dropdown menus): compact height, soft fill, label on the
+/// right of an optional icon.
+pub fn flat_menu_btn(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    p: &Palette,
+    cx: &App,
+) -> Button {
+    let (fill, hover) = flat_fill(p);
+    button(id)
+        .custom(
+            gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                .color(fill)
+                .foreground(p.text)
+                .hover(hover)
+                .active(hover),
+        )
+        .small()
+        .h(px(32.))
+        .px(px(12.))
+        .text_size(px(12.))
+        .font_weight(FontWeight(550.))
+        .label(label)
+        .dropdown_caret(true)
+}
+
+/// A pill of a multi-select row: the soft accent tint while on, the flat
+/// fill while off. Compact, like [`flat_btn`].
+pub fn toggle_chip(
+    id: impl Into<ElementId>,
+    on: bool,
+    enabled: bool,
+    p: &Palette,
+) -> Stateful<Div> {
+    if on {
+        soft_accent_btn(id, enabled, p).text_color(p.text)
+    } else {
+        flat_btn(id, enabled, true, p).text_color(p.muted)
+    }
+}
+
 /// Border of a focused dialog field (desktop `--subtle-border-strong`):
 /// faint, never a coloured ring.
 pub fn field_focus_border(p: &Palette) -> Hsla {
@@ -360,7 +402,7 @@ pub fn field_shell(focused: bool, p: &Palette) -> Div {
 /// Rest and hover fills of [`flat_btn`].
 pub fn flat_fill(p: &Palette) -> (Hsla, Hsla) {
     if p.dark {
-        (hsla(0., 0., 1., 0.045), hsla(0., 0., 1., 0.09))
+        (hsla(0., 0., 1., 0.07), hsla(0., 0., 1., 0.12))
     } else {
         (p.muted.opacity(0.07), p.muted.opacity(0.13))
     }
