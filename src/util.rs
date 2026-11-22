@@ -108,7 +108,7 @@ fn parse_zone_tab(tab: &str) -> Vec<String> {
 }
 
 /// A mesh peer ID shortened for display, the same everywhere: the first 12
-/// and last 8 characters, `12D3KooWPtRj…unWZUT62`.
+/// and last 8 characters, `12D3KooWExam…00000001`.
 pub fn short_peer(id: &str) -> String {
     let chars: Vec<char> = id.chars().collect();
     if chars.len() <= 21 {
@@ -271,11 +271,11 @@ mod tests {
     #[test]
     fn peer_ids_shorten_to_12_and_8_around_an_ellipsis() {
         assert_eq!(
-            short_peer("12D3KooWLCvKmZTEpPiXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW"),
-            "12D3KooWLCvK…pKp3jXLW"
+            short_peer("12D3KooWExamplePeerIdForTests000000000000000000001"),
+            "12D3KooWExam…00000001"
         );
         // Nothing to gain from shortening a short id.
-        assert_eq!(short_peer("thor-id"), "thor-id");
+        assert_eq!(short_peer("peer-a-id"), "peer-a-id");
     }
 
     #[test]

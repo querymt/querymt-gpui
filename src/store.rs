@@ -5437,32 +5437,32 @@ mod tests {
 
     #[test]
     fn mesh_models_name_their_node_like_the_mesh_page() {
-        const THOR: &str = "12D3KooWLCvKmZTEpPiXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW";
+        const PEER_A: &str = "12D3KooWExamplePeerIdForTests000000000000000000001";
         let mut rt = AgentRuntime::default();
         // No `node_label` (as an older peer sends): never the raw ID.
         rt.set_models(parse_models(&json!({ "models": [
-            { "id": "codex/gpt-6.2-sol", "provider": "codex", "node_id": THOR },
-            { "id": "codex/gpt-6.2-astra", "provider": "codex", "node_id": "n2", "node_label": "odin" },
+            { "id": "codex/gpt-6.2-sol", "provider": "codex", "node_id": PEER_A },
+            { "id": "codex/gpt-6.2-astra", "provider": "codex", "node_id": "n2", "node_label": "peer-b" },
         ] })));
-        assert_eq!(rt.models[0].node.as_deref(), Some("12D3KooWLCvK…pKp3jXLW"));
+        assert_eq!(rt.models[0].node.as_deref(), Some("12D3KooWExam…00000001"));
         // The mesh list knows its name: used once it arrives.
         rt.mesh_nodes = vec![MeshNode {
-            id: THOR.into(),
-            label: "thor".into(),
+            id: PEER_A.into(),
+            label: "peer-a".into(),
             active_sessions: 0,
             capabilities: Vec::new(),
             transport: String::new(),
         }];
         rt.name_model_nodes();
-        assert_eq!(rt.models[0].node.as_deref(), Some("thor"));
+        assert_eq!(rt.models[0].node.as_deref(), Some("peer-a"));
         assert_eq!(
             rt.models[1].node.as_deref(),
-            Some("odin"),
+            Some("peer-b"),
             "the catalog's label wins"
         );
         assert_eq!(
-            rt.peer_name("12D3KooWPtRjAbCdEfGhIjKlunWZUT62"),
-            "12D3KooWPtRj…unWZUT62"
+            rt.peer_name("12D3KooWExamplePeerIdForTests000000000000000000002"),
+            "12D3KooWExam…00000002"
         );
     }
 
@@ -5475,8 +5475,8 @@ mod tests {
             agent_id: "test-agent".into(),
             id: "s".into(),
             remote: Some(RemoteOwner {
-                node_id: "thor-id".into(),
-                label: Some("thor".into()),
+                node_id: "peer-a-id".into(),
+                label: Some("peer-a".into()),
                 connected: true,
             }),
             ..Default::default()
@@ -5502,7 +5502,7 @@ mod tests {
             else {
                 panic!("a notice");
             };
-            assert_eq!(text, "Usage limit reached on thor");
+            assert_eq!(text, "Usage limit reached on peer-a");
             assert_eq!(detail.len(), 1);
             assert!(detail[0].starts_with("The limit for gpt-6.2-sol (codex) is used up."));
             assert!(!text.contains("mesh_quota_exhausted"));
@@ -5539,7 +5539,7 @@ mod tests {
             "_meta": {
                 "parentSessionId": "p1", "forkOrigin": "user", "forkCount": 2, "hasChildren": true,
                 "messageCount": 5, "hasErrors": true,
-                "location": "remote", "nodeId": "12D3KooWLCvKmZTEpPiXHWcXgXF89NHvQcB2fezfSX9BpKp3jXLW", "nodeLabel": "", "connectionState": "disconnected",
+                "location": "remote", "nodeId": "12D3KooWExamplePeerIdForTests000000000000000000001", "nodeLabel": "", "connectionState": "disconnected",
                 "runtimeStatus": { "phase": "idle", "observation": { "availability": "unavailable" } },
                 "querymt": {
                     "lifecycle": { "session_id": "s1", "resolved": true, "archived": false },
@@ -5559,7 +5559,7 @@ mod tests {
         let remote = s.remote.unwrap();
         assert!(!remote.connected);
         // No label: the short peer ID, as everywhere.
-        assert_eq!(remote.name(), "12D3KooWLCvK…pKp3jXLW");
+        assert_eq!(remote.name(), "12D3KooWExam…00000001");
 
         let bare = SessionSummary::from_list_entry("a", &json!({ "sessionId": "s2", "cwd": "/w" }));
         assert!(bare.root && !bare.lifecycle_known && bare.status_unknown());

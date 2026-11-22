@@ -1956,7 +1956,7 @@ mod tests {
 
     fn access(revision: &str, grant: Value) -> Value {
         json!({
-            "version": 1, "peer_id": "thor-id",
+            "version": 1, "peer_id": "peer-a-id",
             "outgoing": { "revision": revision, "grant": grant, "quotas": [] },
             "incoming": { "status": "unavailable" },
             "shareable_catalog": [{ "provider_id": "codex", "models": [
@@ -1964,7 +1964,7 @@ mod tests {
         })
     }
 
-    /// The Mesh page of an agent with mesh access v1 and one peer, `thor`,
+    /// The Mesh page of an agent with mesh access v1 and one peer, `peer-a`,
     /// whose sharing has loaded (No access, revision `r1`) and is open.
     fn harness(cx: &mut gpui_kit::TestAppContext) -> Harness {
         use gpui_kit::AppContext as _;
@@ -1974,6 +1974,8 @@ mod tests {
         });
         let mut store = crate::store::launch::peer_fixture();
         let (rpc, requests) = store.rpc_for_test("test-agent");
+        // A peer with a saved policy, so its row and panel render.
+        store.runtime_mut_for_test("test-agent").managed_peers = vec!["peer-a-id".into()];
         store.runtime_mut_for_test("test-agent").capabilities = Some(json!({
             "features": { "mesh": true },
             "mesh_access_version": 1,
@@ -1995,9 +1997,10 @@ mod tests {
         cx.update(|cx| {
             h.app.update(cx, |app, cx| {
                 app.page = Page::Mesh;
-                app.sharing.open = Some("thor-id".into());
-                app.store
-                    .update(cx, |s, cx| s.load_peer_sharing("test-agent", "thor-id", cx));
+                app.sharing.open = Some("peer-a-id".into());
+                app.store.update(cx, |s, cx| {
+                    s.load_peer_sharing("test-agent", "peer-a-id", cx)
+                });
             })
         });
         cx.run_until_parked();
@@ -2013,18 +2016,24 @@ mod tests {
         let h = harness(cx);
         cx.update(|cx| {
             h.app.update(cx, |app, cx| {
-                app.edit_draft("thor-id", cx, |d| d.set_mode("full"));
-                let draft = &app.sharing.drafts["thor-id"];
+                app.edit_draft("peer-a-id", cx, |d| d.set_mode("full"));
+                let draft = &app.sharing.drafts["peer-a-id"];
                 assert!(!draft.can_save(), "not before the acknowledgement");
-                app.edit_draft("thor-id", cx, |d| d.full_ack = true);
-                assert!(app.sharing.drafts["thor-id"].can_save());
+                app.edit_draft("peer-a-id", cx, |d| d.full_ack = true);
+                assert!(app.sharing.drafts["peer-a-id"].can_save());
             })
         });
         h.render(cx);
         cx.update(|cx| {
             h.app.update(cx, |app, cx| {
-                let grant = app.sharing.drafts["thor-id"].grant.clone();
-                app.sharing_write("test-agent", "thor-id", Op::Grant, Write::Grant(grant), cx);
+                let grant = app.sharing.drafts["peer-a-id"].grant.clone();
+                app.sharing_write(
+                    "test-agent",
+                    "peer-a-id",
+                    Op::Grant,
+                    Write::Grant(grant),
+                    cx,
+                );
             })
         });
         cx.run_until_parked();
@@ -2034,7 +2043,7 @@ mod tests {
         assert_eq!(write["params"]["grant"], json!({ "mode": "full" }));
         h.reply(
             &write,
-            json!({ "version": 1, "peer_id": "thor-id", "outgoing": {
+            json!({ "version": 1, "peer_id": "peer-a-id", "outgoing": {
                 "revision": "r2", "grant": { "mode": "full" }, "quotas": [] } }),
             cx,
         );
@@ -2045,7 +2054,7 @@ mod tests {
             let saved = app
                 .store
                 .read(cx)
-                .peer_sharing("test-agent", "thor-id")
+                .peer_sharing("test-agent", "peer-a-id")
                 .and_then(|s| s.access.clone())
                 .unwrap();
             assert_eq!(saved.outgoing.grant, PeerGrant::Full);
@@ -2057,10 +2066,16 @@ mod tests {
         let h = harness(cx);
         cx.update(|cx| {
             h.app.update(cx, |app, cx| {
-                app.edit_draft("thor-id", cx, |d| d.set_mode("custom"));
-                app.edit_draft("thor-id", cx, |d| d.set_sessions(true));
-                let grant = app.sharing.drafts["thor-id"].grant.clone();
-                app.sharing_write("test-agent", "thor-id", Op::Grant, Write::Grant(grant), cx);
+                app.edit_draft("peer-a-id", cx, |d| d.set_mode("custom"));
+                app.edit_draft("peer-a-id", cx, |d| d.set_sessions(true));
+                let grant = app.sharing.drafts["peer-a-id"].grant.clone();
+                app.sharing_write(
+                    "test-agent",
+                    "peer-a-id",
+                    Op::Grant,
+                    Write::Grant(grant),
+                    cx,
+                );
             })
         });
         cx.run_until_parked();
@@ -2079,13 +2094,13 @@ mod tests {
         assert!(h.requests.try_recv().is_err(), "no automatic retry");
         cx.update(|cx| {
             let app = h.app.read(cx);
-            let draft = &app.sharing.drafts["thor-id"];
+            let draft = &app.sharing.drafts["peer-a-id"];
             assert_eq!(
                 draft.changed_elsewhere,
                 vec!["Access changed from No access to Full access."]
             );
             assert!(!draft.can_save(), "the owner decides first");
-            let error = &app.sharing.errors[&("thor-id".to_string(), Op::Grant)];
+            let error = &app.sharing.errors[&("peer-a-id".to_string(), Op::Grant)];
             assert!(error.starts_with("Not saved: sharing for this peer changed elsewhere."));
             assert!(error.contains("No access to Full access"));
         });
