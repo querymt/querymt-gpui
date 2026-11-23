@@ -310,6 +310,8 @@ impl QmtApp {
     /// their limits; collapsed, all pinned then the same open rows, in one
     /// list (the rail has no "Show more pinned").
     pub(super) fn sidebar_shown(&self, cx: &App) -> Shown {
+        // Sorts and copies sessions; the sidebar and the palette both ask.
+        crate::telemetry::profile_zone!("QueryMT: Order sidebar sessions");
         let store = self.store.read(cx);
         let current = self.current_tab(cx);
         let pinned = store.sidebar_sessions(SideList::Pinned);
@@ -433,7 +435,7 @@ impl QmtApp {
             this.render_side_item(rail, ix, cx)
         });
         list(side.state.clone(), move |ix, window, cx| {
-            render(ix, window, cx)
+            crate::telemetry::profile_element!("QueryMT: Sidebar row", render(ix, window, cx))
         })
         .flex_1()
         .min_h_0()

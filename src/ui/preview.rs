@@ -60,6 +60,14 @@ pub(super) fn step_zoom(zoom: f32, up: bool) -> f32 {
 /// Decoded image of a transcript attachment, when it carries inline bytes.
 pub(super) fn user_attachment_image(a: &UserAttachment) -> Option<Arc<Image>> {
     let data = a.data.as_deref().filter(|_| a.is_image())?;
+    // Runs each time a transcript row with the image is built.
+    crate::telemetry::profile_zone!(
+        "QueryMT: Decode attachment image",
+        "{}, {} base64 bytes",
+        a.mime,
+        data.len()
+    );
+    crate::telemetry::profiler::count(crate::telemetry::profiler::Count::ImageDecode);
     let format = ImageFormat::from_mime_type(&a.mime)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data)

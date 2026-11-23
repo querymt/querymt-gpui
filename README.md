@@ -41,6 +41,49 @@ System graphics/windowing libraries are still required; this is not a fully stat
 portable Linux binary. Size optimization can reduce peak throughput; use debug
 builds when you need symbols and panic backtraces.
 
+### Profile With Tracy
+
+```bash
+nix develop -c cargo run --features tracy
+```
+
+Connect with the Tracy **0.13.1** viewer (other versions report an incompatible
+protocol):
+
+```bash
+nix shell --inputs-from . nixpkgs#tracy -c env -u LD_LIBRARY_PATH tracy -a 127.0.0.1
+```
+
+The client listens on `127.0.0.1:8086` and records only while connected:
+`QueryMT:` zones, plots and messages. Areas of the window (title bar, sidebar,
+page, transcript rows, …) also get `(layout)`, `(prepaint)` and `(paint)` zones.
+
+Heap allocations (**Memory** window) are opt-in, because the viewer keeps every
+event: `--features tracy-memory`, or `tracy-memory-callstacks` to also record
+where each allocation came from.
+
+The **Sampling** flame graph covers GPUI and other code without zones. It needs
+`kernel.perf_event_paranoid` at 1 or lower (the default is 2); context switches
+(**Running time**) also need tracefs access, so run as root for those.
+
+```bash
+sudo sysctl kernel.perf_event_paranoid=1
+```
+
+For an optimized build with symbols:
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
+  nix develop -c cargo run --release --features tracy
+```
+
+To save a 15-second capture instead:
+
+```bash
+nix shell --inputs-from . nixpkgs#tracy -c env -u LD_LIBRARY_PATH \
+  tracy-capture -a 127.0.0.1 -o querymt.tracy -s 15
+```
+
 ## Web
 
 ```bash

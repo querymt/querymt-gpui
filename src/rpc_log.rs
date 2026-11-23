@@ -273,12 +273,17 @@ impl WireLog {
             reply: None,
             merged: 1,
         });
-        while inner.events.len() > CAP_EVENTS {
-            if let Some(old) = inner.events.pop_front() {
-                inner.requests.retain(|_, s| *s != old.seq);
-                inner.agent_requests.retain(|_, s| *s != old.seq);
+        if inner.events.len() > CAP_EVENTS {
+            // Once full, every push scans the request maps for the evicted one.
+            crate::telemetry::profile_zone!("QueryMT: Evict debug event");
+            while inner.events.len() > CAP_EVENTS {
+                if let Some(old) = inner.events.pop_front() {
+                    inner.requests.retain(|_, s| *s != old.seq);
+                    inner.agent_requests.retain(|_, s| *s != old.seq);
+                }
             }
         }
+        crate::telemetry::profile_plot!("QueryMT: debug event log entries", inner.events.len());
         drop(inner);
         self.bump();
         seq

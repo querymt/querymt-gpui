@@ -324,6 +324,7 @@ impl SessionList {
     /// Replace the entries, invalidating only the ones whose height may have
     /// changed so the list keeps its measurements and scroll position.
     fn sync(&mut self, entries: Vec<Entry>, rc: RowCtx, global: u64) {
+        crate::telemetry::profile_zone!("QueryMT: Sync session catalog list");
         let sigs: Vec<u64> = entries.iter().map(Entry::sig).collect();
         if self.global != Some(global) {
             self.state.reset(sigs.len());
@@ -477,6 +478,7 @@ fn skeleton_rows() -> AnyElement {
 
 impl QmtApp {
     pub(super) fn render_sessions(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::telemetry::profile_zone!("QueryMT: Build session catalog view");
         let p = *palette(cx);
         let query = self.session_query.read(cx).value().trim().to_lowercase();
         let store = self.store.read(cx);
@@ -516,12 +518,16 @@ impl QmtApp {
                 (c.id.clone(), info)
             })
             .collect();
-        let roots: Vec<SessionSummary> = store
-            .all_sessions()
-            .into_iter()
-            .filter(|s| s.root)
-            .cloned()
-            .collect();
+        let roots: Vec<SessionSummary> = {
+            crate::telemetry::profile_zone!("QueryMT: Copy root sessions");
+            store
+                .all_sessions()
+                .into_iter()
+                .filter(|s| s.root)
+                .cloned()
+                .collect()
+        };
+        crate::telemetry::profile_plot!("QueryMT: catalog root sessions", roots.len());
         let agent_name = |id: &str| agents.get(id).map(|a| a.name.as_str()).unwrap_or_default();
 
         let count = |tab| roots.iter().filter(|s| in_tab(s, tab)).count();
@@ -555,71 +561,84 @@ impl QmtApp {
         let tab = filters.tab();
         let refinements = filters.refinements(show_location);
         let unknown_lifecycle = roots.iter().filter(|s| !s.lifecycle_known).count();
-        let mut visible: Vec<SessionSummary> = roots
-            .iter()
-            .filter(|s| {
-                matches_lifecycle(s, filters.resolution, filters.archive)
-                    && matches_refinements(
-                        s,
-                        &filters,
-                        needs_input.contains(&(s.agent_id.as_str(), s.id.as_str())),
-                    )
-                    && matches_query(s, agent_name(&s.agent_id), &query)
-            })
-            .cloned()
-            .collect();
-        visible.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let visible = {
+            crate::telemetry::profile_zone!("QueryMT: Filter and sort session catalog");
+            let mut visible: Vec<SessionSummary> = roots
+                .iter()
+                .filter(|s| {
+                    matches_lifecycle(s, filters.resolution, filters.archive)
+                        && matches_refinements(
+                            s,
+                            &filters,
+                            needs_input.contains(&(s.agent_id.as_str(), s.id.as_str())),
+                        )
+                        && matches_query(s, agent_name(&s.agent_id), &query)
+                })
+                .cloned()
+                .collect();
+            visible.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            visible
+        };
 
         // Pinned, then recently opened, then workspaces by latest activity.
         // Pinned and recent rows also stay in their workspace group.
-        let mut groups: Vec<Group> = Vec::new();
-        let pinned: Vec<SessionSummary> = visible.iter().filter(|s| s.pinned).cloned().collect();
-        if !pinned.is_empty() {
-            groups.push(Group {
-                key: PINNED_KEY.into(),
-                name: "Pinned sessions".into(),
-                kind: GroupKind::Pinned,
-                sessions: pinned,
-            });
-        }
-        let recent: Vec<SessionSummary> = store
-            .prefs
-            .recent_sessions
-            .iter()
-            .filter_map(|(agent, id)| {
-                visible
-                    .iter()
-                    .find(|s| &s.agent_id == agent && &s.id == id && !s.pinned)
-            })
-            .cloned()
-            .collect();
-        if !recent.is_empty() {
-            groups.push(Group {
-                key: RECENT_KEY.into(),
-                name: "Recent sessions".into(),
-                kind: GroupKind::Recent,
-                sessions: recent,
-            });
-        }
-        for s in visible {
-            let cwd = s.group_cwd().to_string();
-            match groups
-                .iter_mut()
-                .find(|g| g.kind == GroupKind::Workspace && g.key == cwd)
-            {
-                Some(g) => g.sessions.push(s),
-                None => groups.push(Group {
-                    name: if cwd.is_empty() {
-                        "No workspace".into()
-                    } else {
-                        workspace_name(&cwd)
-                    },
-                    key: cwd,
-                    kind: GroupKind::Workspace,
-                    sessions: vec![s],
-                }),
+        let groups = {
+            crate::telemetry::profile_zone!(
+                "QueryMT: Group session catalog",
+                "{} sessions",
+                visible.len()
+            );
+            let mut groups: Vec<Group> = Vec::new();
+            let pinned: Vec<SessionSummary> =
+                visible.iter().filter(|s| s.pinned).cloned().collect();
+            if !pinned.is_empty() {
+                groups.push(Group {
+                    key: PINNED_KEY.into(),
+                    name: "Pinned sessions".into(),
+                    kind: GroupKind::Pinned,
+                    sessions: pinned,
+                });
             }
-        }
+            let recent: Vec<SessionSummary> = store
+                .prefs
+                .recent_sessions
+                .iter()
+                .filter_map(|(agent, id)| {
+                    visible
+                        .iter()
+                        .find(|s| &s.agent_id == agent && &s.id == id && !s.pinned)
+                })
+                .cloned()
+                .collect();
+            if !recent.is_empty() {
+                groups.push(Group {
+                    key: RECENT_KEY.into(),
+                    name: "Recent sessions".into(),
+                    kind: GroupKind::Recent,
+                    sessions: recent,
+                });
+            }
+            for s in visible {
+                let cwd = s.group_cwd().to_string();
+                match groups
+                    .iter_mut()
+                    .find(|g| g.kind == GroupKind::Workspace && g.key == cwd)
+                {
+                    Some(g) => g.sessions.push(s),
+                    None => groups.push(Group {
+                        name: if cwd.is_empty() {
+                            "No workspace".into()
+                        } else {
+                            workspace_name(&cwd)
+                        },
+                        key: cwd,
+                        kind: GroupKind::Workspace,
+                        sessions: vec![s],
+                    }),
+                }
+            }
+            groups
+        };
         let rc = RowCtx {
             p,
             show_agent: connected.len() > 1,
@@ -632,11 +651,15 @@ impl QmtApp {
         }
         let has_groups = !groups.is_empty();
         let mut entries = Vec::new();
-        for (i, g) in groups.into_iter().enumerate() {
-            self.push_group_entries(&mut entries, g, i == 0, &rc, store);
+        {
+            crate::telemetry::profile_zone!("QueryMT: Build session catalog entries");
+            for (i, g) in groups.into_iter().enumerate() {
+                self.push_group_entries(&mut entries, g, i == 0, &rc, store);
+            }
         }
         // Inputs every row depends on: a change rebuilds the whole list.
         let global = hash_of(|h| {
+            crate::telemetry::profile_zone!("QueryMT: Hash session catalog inputs");
             (rc.show_agent, rc.all_tab, rc.searching).hash(h);
             // A filter change starts the list over at the top.
             (
@@ -907,7 +930,10 @@ impl QmtApp {
             let render =
                 cx.processor(|this: &mut Self, ix: usize, _, cx| this.render_session_entry(ix, cx));
             list(self.session_list.state.clone(), move |ix, window, cx| {
-                render(ix, window, cx)
+                crate::telemetry::profile_element!(
+                    "QueryMT: Session catalog row",
+                    render(ix, window, cx)
+                )
             })
             .size_full()
             .pb_6()

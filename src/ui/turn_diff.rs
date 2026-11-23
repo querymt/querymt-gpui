@@ -237,6 +237,7 @@ impl QmtApp {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        crate::telemetry::profile_zone!("QueryMT: Build turn diff panel");
         let sticky = self.sticky_file(&files);
         let header = self.panel_header(&files, p, cx);
         let sections: Vec<AnyElement> = files

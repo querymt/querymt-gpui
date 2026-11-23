@@ -113,8 +113,10 @@ impl RpcClient {
             rpc.error = tracing::field::Empty,
         );
         self.pending.borrow_mut().insert(id, (tx, span.clone()));
-        let text =
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": &params }).to_string();
+        let text = {
+            crate::telemetry::profile_zone!("QueryMT: Encode RPC request", "{method}");
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": &params }).to_string()
+        };
         span.record("rpc.request_bytes", text.len());
         if let Some(wire) = self.recording() {
             wire.sent_request(id, method, &params, &text);
@@ -157,18 +159,26 @@ impl RpcClient {
 
     /// Route one inbound line: resolves responses, returns notifications and requests.
     pub fn handle(&self, text: &str) -> Option<Incoming> {
+        crate::telemetry::profile_zone!("QueryMT: Handle incoming RPC", "{} bytes", text.len());
         #[cfg(not(target_family = "wasm"))]
         if std::env::var_os("QMT_DEBUG").is_some() {
             eprintln!("[rpc <-] {}", text.chars().take(200).collect::<String>());
         }
         let parse_started = crate::util::now_ms();
-        let message: Value = serde_json::from_str(text).ok()?;
+        let message: Value = {
+            crate::telemetry::profile_zone!("QueryMT: Decode RPC JSON");
+            serde_json::from_str(text).ok()?
+        };
         let parse_ms = crate::util::now_ms() - parse_started;
         if let Some(wire) = self.recording() {
+            crate::telemetry::profile_zone!("QueryMT: Record incoming RPC");
             wire.received(&message, text);
         }
         if let Some(method) = message.get("method").and_then(Value::as_str) {
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            let params = {
+                crate::telemetry::profile_zone!("QueryMT: Copy notification params", "{method}");
+                message.get("params").cloned().unwrap_or(Value::Null)
+            };
             return Some(match message.get("id") {
                 Some(id) if !id.is_null() => Incoming::Request {
                     id: id.clone(),
@@ -183,6 +193,11 @@ impl RpcClient {
         }
         let id = message.get("id").and_then(Value::as_u64)?;
         let (pending, span) = self.pending.borrow_mut().remove(&id)?;
+        crate::telemetry::profile_zone!(
+            "QueryMT: Resolve RPC response",
+            "id {id}, {} bytes",
+            text.len()
+        );
         span.record("rpc.response_bytes", text.len());
         span.record("rpc.parse_ms", parse_ms);
         let result = match message.get("error") {
@@ -204,7 +219,11 @@ impl RpcClient {
                     raw: Some(error.clone()),
                 })
             }
-            None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+            None => Ok({
+                // A deep copy of the whole result (a session load can be megabytes).
+                crate::telemetry::profile_zone!("QueryMT: Copy RPC result");
+                message.get("result").cloned().unwrap_or(Value::Null)
+            }),
         };
         if let Err(err) = &result {
             span.record("rpc.error", err.message.as_str());

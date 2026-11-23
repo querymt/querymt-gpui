@@ -45,6 +45,7 @@ pub(crate) fn highlight_code(
     let Some(syntax) = find_syntax(language) else {
         return Vec::new();
     };
+    crate::telemetry::profile_zone!("QueryMT: Highlight code");
     resolve_styles(&parse(syntax, code), &(0..code.len()), resolver)
 }
 

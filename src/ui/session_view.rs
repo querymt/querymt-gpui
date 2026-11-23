@@ -216,6 +216,9 @@ fn sample_transcript(
         crate::telemetry::record_frame(frame_ms, rows);
         if frame_ms > SLOW_FRAME_MS {
             let (row_key, row_kind, row_entries, row_ms) = slowest.unwrap_or_default();
+            crate::telemetry::profile_message!(
+                "Slow transcript frame: {frame_ms:.1} ms, {rows} rows; slowest {row_kind} row {row_key} ({row_entries} entries) {row_ms:.1} ms"
+            );
             tracing::warn!(
                 session.id = p.session.as_str(),
                 frame.ms = frame_ms,
@@ -511,15 +514,33 @@ impl Transcript {
     }
 
     fn sync(&mut self, session: &str, view: &[Item], rc: &RenderCtx) {
+        crate::telemetry::profile_zone!("QueryMT: Sync transcript");
         let specs = transcript_rows(view, rc);
-        let sigs: Vec<u64> = specs.iter().map(|r| rc.row_sig(&view[r.ix], r)).collect();
+        let sigs: Vec<u64> = {
+            crate::telemetry::profile_zone!("QueryMT: Hash transcript rows");
+            specs.iter().map(|r| rc.row_sig(&view[r.ix], r)).collect()
+        };
         // One snapshot per item, shared by its rows; taken only for rows
         // that changed.
         let mut snapshots: HashMap<usize, Rc<Item>> = HashMap::new();
         let mut row = |spec: &RowSpec| -> Rc<Row> {
             let item = snapshots
                 .entry(spec.ix)
-                .or_insert_with(|| Rc::new(view[spec.ix].clone()))
+                .or_insert_with(|| {
+                    // A deep copy: a work group's entries, a reply's text.
+                    crate::telemetry::profile_zone!(
+                        "QueryMT: Snapshot transcript item",
+                        "{}",
+                        match &view[spec.ix].kind {
+                            ItemKind::Work(e) => format!("work, {} entries", e.len()),
+                            ItemKind::Agent { text } => format!("reply, {} bytes", text.len()),
+                            ItemKind::User { text, .. } => format!("user, {} bytes", text.len()),
+                            ItemKind::Notice { .. } => "notice".into(),
+                            ItemKind::Compaction(_) => "compaction".into(),
+                        }
+                    );
+                    Rc::new(view[spec.ix].clone())
+                })
                 .clone();
             Rc::new(Row {
                 item,
@@ -528,10 +549,17 @@ impl Transcript {
                 key: spec.key.clone(),
             })
         };
-        let keys: Vec<String> = specs.iter().map(|r| r.key.clone()).collect();
+        let keys: Vec<String> = {
+            crate::telemetry::profile_zone!(
+                "QueryMT: Copy transcript row keys",
+                "{} rows",
+                specs.len()
+            );
+            specs.iter().map(|r| r.key.clone()).collect()
+        };
         if session != self.session {
             self.session = session.to_string();
-            if crate::telemetry::enabled() {
+            if crate::telemetry::probing() {
                 let mut probe = self.probe.borrow_mut();
                 *probe = ScrollProbe {
                     layout_seq: probe.layout_seq,
@@ -577,6 +605,12 @@ impl Transcript {
         }
         let (old_mid, new_mid) = (head..old_len - tail, head..new_len - tail);
         if !old_mid.is_empty() || !new_mid.is_empty() {
+            crate::telemetry::profile_zone!(
+                "QueryMT: Splice transcript rows",
+                "{} rows replaced by {}",
+                old_mid.len(),
+                new_mid.len()
+            );
             let fresh: Vec<Rc<Row>> = specs[new_mid.clone()].iter().map(&mut row).collect();
             items.splice(old_mid.clone(), fresh);
             self.list.splice(old_mid.clone(), new_mid.len());
@@ -1335,8 +1369,12 @@ pub(super) fn diff_rows(
     cap: usize,
     p: &Palette,
 ) -> (Vec<AnyElement>, usize, usize, usize) {
+    crate::telemetry::profile_zone!("QueryMT: Build diff rows");
     let old = d.old.clone().unwrap_or_default();
-    let diff = similar::TextDiff::from_lines(&old, &d.new);
+    let diff = {
+        crate::telemetry::profile_zone!("QueryMT: Compute line diff");
+        similar::TextDiff::from_lines(&old, &d.new)
+    };
     let (mut adds, mut dels) = (0usize, 0usize);
     let mut rows: Vec<AnyElement> = Vec::new();
     let mut shown = 0usize;
@@ -3314,6 +3352,7 @@ struct RowSpec {
 /// Rows of the view: one per item, and a large expanded work group as its
 /// header plus one row per visible block.
 fn transcript_rows(view: &[Item], rc: &RenderCtx) -> Vec<RowSpec> {
+    crate::telemetry::profile_zone!("QueryMT: Plan transcript rows");
     let mut rows = Vec::with_capacity(view.len());
     for (ix, item) in view.iter().enumerate() {
         let plan = match &item.kind {
@@ -3355,6 +3394,7 @@ fn transcript_rows(view: &[Item], rc: &RenderCtx) -> Vec<RowSpec> {
 }
 
 fn render_row(row: &Row, rc: &RenderCtx) -> AnyElement {
+    crate::telemetry::profile_zone!("QueryMT: Build transcript row", "{}", row.key);
     let (ix, item) = (row.ix, row.item.as_ref());
     match (&row.part, &item.kind) {
         (Part::Head, ItemKind::Work(entries)) => {
@@ -3906,6 +3946,7 @@ impl QmtApp {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> Option<(AnyElement, Vec<AnyElement>)> {
+        crate::telemetry::profile_zone!("QueryMT: Build session title bar");
         let (view, summary, plan) = {
             let store = self.store.read(cx);
             let session = store.session.as_ref()?;
@@ -4991,6 +5032,7 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        crate::telemetry::profile_zone!("QueryMT: Build session view");
         let p = *palette(cx);
         let store = self.store.read(cx);
         let Some(view) = store.session.as_ref() else {
@@ -5042,7 +5084,11 @@ impl QmtApp {
             })
             .map(|r| r.key.clone())
             .collect();
-        let (act_title, act_preview) = activity(view);
+        crate::telemetry::profile_plot!("QueryMT: transcript items", view.items.len());
+        let (act_title, act_preview) = {
+            crate::telemetry::profile_zone!("QueryMT: Describe session activity");
+            activity(view)
+        };
         // Untruncated shell command of the running tool, for the bar's tooltip.
         let act_full = match view.items.last().map(|i| &i.kind) {
             Some(ItemKind::Work(entries)) => match entries.last() {
@@ -5054,69 +5100,89 @@ impl QmtApp {
             _ => None,
         };
 
-        let turn_end = turn_ends(&view.items);
-        let reverted_from = view.reverted_from().and_then(|id| {
-            view.items
-                .iter()
-                .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
-        });
-        // Desktop: forks only from settled, live turns while nothing else runs.
-        let fork_ready = store.session_supports_fork()
-            && !store.fork_pending()
-            && !running
-            && !loading
-            && !view.undo_pending;
-        let fork_points: HashSet<usize> = if fork_ready {
-            turn_end
-                .keys()
-                .copied()
-                .filter(|ix| reverted_from.is_none_or(|r| *ix < r))
-                .filter(|ix| view.fork_point(*ix).is_some())
-                .collect()
-        } else {
-            HashSet::new()
+        // Runs on every app build, over the whole transcript.
+        let rc = {
+            crate::telemetry::profile_zone!(
+                "QueryMT: Prepare transcript render state",
+                "{} items",
+                view.items.len()
+            );
+            let turn_end = {
+                crate::telemetry::profile_zone!("QueryMT: Compute turn change stats");
+                turn_ends(&view.items)
+            };
+            let (reverted_from, undoable, turn_user) = {
+                crate::telemetry::profile_zone!("QueryMT: Compute undo state");
+                let reverted_from = view.reverted_from().and_then(|id| {
+                    view.items
+                        .iter()
+                        .position(|i| i.key == id && matches!(i.kind, ItemKind::User { .. }))
+                });
+                let undoable: HashSet<String> = view
+                    .items
+                    .iter()
+                    .filter(|i| matches!(i.kind, ItemKind::User { .. }))
+                    .filter(|i| view.undo_affected_turns(&i.key).is_some())
+                    .map(|i| i.key.clone())
+                    .collect();
+                (reverted_from, undoable, turn_users(&view.items))
+            };
+            // Desktop: forks only from settled, live turns while nothing else runs.
+            let fork_ready = store.session_supports_fork()
+                && !store.fork_pending()
+                && !running
+                && !loading
+                && !view.undo_pending;
+            let fork_points: HashSet<usize> = if fork_ready {
+                crate::telemetry::profile_zone!("QueryMT: Compute fork points");
+                turn_end
+                    .keys()
+                    .copied()
+                    .filter(|ix| reverted_from.is_none_or(|r| *ix < r))
+                    .filter(|ix| view.fork_point(*ix).is_some())
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let diff_open = self
+                .turn_diff_range(cx)
+                .and_then(|r| turn_end.keys().copied().filter(|ix| r.contains(ix)).max());
+            Rc::new(RenderCtx {
+                p,
+                syntax: gpui_kit::component::ActiveTheme::theme(&**cx)
+                    .highlight_theme
+                    .clone(),
+                weak: cx.entity().downgrade(),
+                smooth_scroll: self.smooth_scroll.clone(),
+                expanded: self.expanded_items.clone(),
+                running,
+                last_turn_start: view
+                    .items
+                    .iter()
+                    .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
+                    .unwrap_or(0),
+                last_ix: view.items.len().saturating_sub(1),
+                turn_end,
+                copied: self.copied.clone(),
+                block_scrolls: self.transcript.block_scrolls.clone(),
+                cwd: view.cwd.clone(),
+                turn_user,
+                undo_ready: store.session_supports_undo()
+                    && !running
+                    && !loading
+                    && !view.undo_pending,
+                undoable,
+                redo_target: view.redo_target().map(str::to_owned),
+                fork_points,
+                diff_open,
+                reverted_from,
+                agent_id: view.agent_id.clone(),
+                stream_fade: store.prefs.stream_fade.unwrap_or(true),
+                md: self.transcript.md.clone(),
+                tool_content: store.supports_tool_content(),
+                developer: store.prefs.developer_mode,
+            })
         };
-        let diff_open = self
-            .turn_diff_range(cx)
-            .and_then(|r| turn_end.keys().copied().filter(|ix| r.contains(ix)).max());
-        let rc = Rc::new(RenderCtx {
-            p,
-            syntax: gpui_kit::component::ActiveTheme::theme(&**cx)
-                .highlight_theme
-                .clone(),
-            weak: cx.entity().downgrade(),
-            smooth_scroll: self.smooth_scroll.clone(),
-            expanded: self.expanded_items.clone(),
-            running,
-            last_turn_start: view
-                .items
-                .iter()
-                .rposition(|i| matches!(i.kind, ItemKind::User { .. }))
-                .unwrap_or(0),
-            last_ix: view.items.len().saturating_sub(1),
-            turn_end,
-            copied: self.copied.clone(),
-            block_scrolls: self.transcript.block_scrolls.clone(),
-            cwd: view.cwd.clone(),
-            turn_user: turn_users(&view.items),
-            undo_ready: store.session_supports_undo() && !running && !loading && !view.undo_pending,
-            undoable: view
-                .items
-                .iter()
-                .filter(|i| matches!(i.kind, ItemKind::User { .. }))
-                .filter(|i| view.undo_affected_turns(&i.key).is_some())
-                .map(|i| i.key.clone())
-                .collect(),
-            redo_target: view.redo_target().map(str::to_owned),
-            fork_points,
-            diff_open,
-            reverted_from,
-            agent_id: view.agent_id.clone(),
-            stream_fade: store.prefs.stream_fade.unwrap_or(true),
-            md: self.transcript.md.clone(),
-            tool_content: store.supports_tool_content(),
-            developer: store.prefs.developer_mode,
-        });
         self.transcript.sync(&key, &view.items, &rc);
         if !self.transcript.scroll_hooked {
             self.transcript.scroll_hooked = true;
@@ -5146,7 +5212,10 @@ impl QmtApp {
         }
 
         // Snapshot what the composer/header need before borrowing self mutably.
-        let view_snapshot = view.shallow();
+        let view_snapshot = {
+            crate::telemetry::profile_zone!("QueryMT: Snapshot session header state");
+            view.shallow()
+        };
 
         // Title, status, and actions live in the title bar (`session_chrome`);
         // only the context strip stays on the page.
@@ -5259,7 +5328,7 @@ impl QmtApp {
             let rc2 = rc.clone();
             let render_items = items.clone();
             // Telemetry: time each row built and the transcript's frame.
-            let timed = crate::telemetry::enabled();
+            let timed = crate::telemetry::probing();
             let row_probe = self.transcript.probe.clone();
             div()
                 .relative()
@@ -5305,7 +5374,8 @@ impl QmtApp {
                                 .flex_1()
                                 .min_h_0()
                                 .w_full()
-                                .child(
+                                .child(crate::telemetry::profile_element!(
+                                    "QueryMT: Transcript list",
                                     self.smooth_scroll.region(
                                         "transcript",
                                         list(self.transcript.list.clone(), move |ix, _, _| {
@@ -5314,7 +5384,14 @@ impl QmtApp {
                                                 Some(row) => {
                                                     let started = timed.then(crate::util::now_ms);
                                                     rc2.md.begin_row(&row.key);
-                                                    let el = render_row(&row, &rc2);
+                                                    // Measured rows lay out here; the
+                                                    // list's prepaint holds that time.
+                                                    let el = crate::telemetry::profile_element!(
+                                                        "QueryMT: Transcript row",
+                                                        render_row(&row, &rc2),
+                                                        "{}",
+                                                        row.key
+                                                    );
                                                     rc2.md.end_row();
                                                     if let Some(started) = started {
                                                         row_probe
@@ -5333,10 +5410,10 @@ impl QmtApp {
                                         .pt(px(TRANSCRIPT_TOP_FADE_H))
                                         .pb(px(composer_h)),
                                     ),
-                                )
+                                ))
                                 // Telemetry: sample the list after its layout (siblings
-                                // prepaint in order). Absent unless export is on.
-                                .when(crate::telemetry::enabled(), |el| {
+                                // prepaint in order). Absent unless export or Tracy is on.
+                                .when(crate::telemetry::probing(), |el| {
                                     let list = self.transcript.list.clone();
                                     let probe = self.transcript.probe.clone();
                                     let smooth = self.smooth_scroll.clone();
@@ -5745,8 +5822,14 @@ impl QmtApp {
                     .gap_2()
                     .children(mcp_notice)
                     .children(request_cards)
-                    .child(dock)
-                    .child(self.smooth_scroll.region("composer", composer)),
+                    .child(crate::telemetry::profile_element!(
+                        "QueryMT: Activity dock",
+                        dock
+                    ))
+                    .child(crate::telemetry::profile_element!(
+                        "QueryMT: Composer",
+                        self.smooth_scroll.region("composer", composer)
+                    )),
             );
 
         let chat = v_flex()

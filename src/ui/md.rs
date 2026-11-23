@@ -239,7 +239,16 @@ impl Kept {
     fn state(&self, id: &str, text: &SharedString, cx: &mut App) -> Entity<TextViewState> {
         let existing = self.0.borrow_mut().views.get_mut(id).map(|view| {
             let same = view.text.as_ptr() == text.as_ptr() && view.text.len() == text.len();
-            let changed = !same && view.text != *text;
+            // A fresh copy of the same text (a re-snapshotted row) still
+            // costs a full comparison.
+            let changed = !same && {
+                crate::telemetry::profile_zone!(
+                    "QueryMT: Compare Markdown text",
+                    "{} bytes",
+                    text.len()
+                );
+                view.text != *text
+            };
             if changed {
                 view.text = text.clone();
             }
@@ -247,21 +256,38 @@ impl Kept {
         });
         if let Some((state, changed)) = existing {
             if changed {
+                crate::telemetry::profile_zone!(
+                    "QueryMT: Update Markdown text",
+                    "{} bytes",
+                    text.len()
+                );
                 state.update(cx, |state, cx| state.set_text(text, cx));
             }
             return state;
         }
-        let state = cx.new(|cx| TextViewState::markdown(text, cx));
+        let state = cx.new(|cx| {
+            crate::telemetry::profile_zone!(
+                "QueryMT: Create Markdown state",
+                "{} bytes",
+                text.len()
+            );
+            TextViewState::markdown(text, cx)
+        });
         let awaited = Rc::new(Cell::new(false));
         let observe = cx.observe(&state, {
             let awaited = awaited.clone();
             move |_, cx| {
                 if awaited.replace(false) {
+                    // Another frame: a row measured short while parsing.
+                    crate::telemetry::profiler::count(
+                        crate::telemetry::profiler::Count::MarkdownRefresh,
+                    );
                     cx.refresh_windows();
                 }
             }
         });
-        self.0.borrow_mut().views.insert(
+        let mut inner = self.0.borrow_mut();
+        inner.views.insert(
             id.to_string(),
             KeptView {
                 state: state.clone(),
@@ -270,6 +296,8 @@ impl Kept {
                 _observe: observe,
             },
         );
+        crate::telemetry::profile_plot!("QueryMT: kept Markdown views", inner.views.len());
+        drop(inner);
         state
     }
 }
@@ -356,6 +384,8 @@ impl Element for CodeHeader {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // Lays out its own row as a separate root.
+        crate::telemetry::profile_zone!("QueryMT: Code block header (prepaint)");
         let inset = window.rem_size() * 0.5;
         self.row.prepaint_as_root(
             bounds.origin - point(px(0.), inset),
@@ -378,6 +408,7 @@ impl Element for CodeHeader {
         window: &mut Window,
         cx: &mut App,
     ) {
+        crate::telemetry::profile_zone!("QueryMT: Code block header (paint)");
         self.row.paint(window, cx);
     }
 }
@@ -435,6 +466,7 @@ struct TableCard {
 
 impl RenderOnce for TableCard {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        crate::telemetry::profile_zone!("QueryMT: Build Markdown table card");
         let p = *palette(cx);
         let chrome = window.use_keyed_state(
             SharedString::from(format!("{}-chrome", self.id)),
