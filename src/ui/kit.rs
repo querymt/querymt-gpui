@@ -330,16 +330,19 @@ pub fn soft_accent_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> 
     )
 }
 
-/// A component `Button` in the [`flat_btn`] look, for the places that need
-/// a `Button` (dropdown menus): compact height, soft fill, label on the
-/// right of an optional icon.
+/// A component `Button` that looks exactly like a compact [`flat_btn`] with a
+/// trailing chevron, for the places that need a `Button` (dropdown menus).
+/// The content is drawn here rather than with the component's label and
+/// caret, which size themselves and so would not match a `flat_btn` beside it.
 pub fn flat_menu_btn(
     id: impl Into<ElementId>,
+    icon_name: Option<IconName>,
     label: impl Into<SharedString>,
     p: &Palette,
     cx: &App,
 ) -> Button {
     let (fill, hover) = flat_fill(p);
+    let label = label.into();
     button(id)
         .custom(
             gpui_kit::component::button::ButtonCustomVariant::new(cx)
@@ -351,10 +354,18 @@ pub fn flat_menu_btn(
         .small()
         .h(px(32.))
         .px(px(12.))
-        .text_size(px(12.))
-        .font_weight(FontWeight(550.))
-        .label(label)
-        .dropdown_caret(true)
+        .rounded(px(8.))
+        .accessibility_label(label.clone())
+        .child(
+            h_flex()
+                .gap(px(6.4))
+                .text_size(px(12.))
+                .font_weight(FontWeight(550.))
+                .text_color(p.text)
+                .when_some(icon_name, |el, name| el.child(icon(name, 12., p.text)))
+                .child(label)
+                .child(icon(IconName::ChevronDown, 12., p.dim)),
+        )
 }
 
 /// A pill of a multi-select row: the soft accent tint while on, the flat

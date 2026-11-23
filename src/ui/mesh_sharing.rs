@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, Sizable as _, StyledExt as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -198,6 +198,10 @@ fn shared<'a>(grant: &'a PeerGrant, provider: &str) -> Option<&'a ModelSelection
         _ => None,
     }
 }
+
+/// Width of the scope column (provider, or one of its models) of a
+/// provider's limit lines, so every usage bar starts at the same x.
+const SCOPE_W: f32 = 200.;
 
 fn subtle_text(p: &Palette) -> Div {
     div().text_xs().text_color(p.muted)
@@ -1102,11 +1106,11 @@ impl QmtApp {
         let enabled = !saving && !available.is_empty();
         let trigger = kit::flat_menu_btn(
             kit::keyed("add-provider", peer.id.clone()),
+            Some(IconName::Plus),
             "Add provider",
             p,
             cx,
-        )
-        .icon(IconName::Plus);
+        );
         if !enabled {
             return trigger
                 .inactive(true)
@@ -1199,7 +1203,6 @@ impl QmtApp {
             .when(!catalog.is_empty(), |el| {
                 el.child(self.add_provider_menu(peer, &available, &order, saving, p, cx))
             });
-        let (divider, _) = kit::subtle(p);
         let list: AnyElement = if catalog.is_empty() {
             subtle_text(p)
                 .px_3()
@@ -1221,12 +1224,11 @@ impl QmtApp {
                 .into_any_element()
         } else {
             let mut rows: Vec<AnyElement> = Vec::new();
-            for (ix, provider) in shared.iter().enumerate() {
+            for provider in &shared {
                 rows.push(
                     self.provider_row(
                         agent, peer, access, grant, provider, &order, saving, p, window, cx,
                     )
-                    .when(ix > 0, |el| el.border_t_1().border_color(divider))
                     .into_any_element(),
                 );
             }
@@ -1237,9 +1239,12 @@ impl QmtApp {
                         .gap_2()
                         .px_3()
                         .py_2()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(p.border)
+                        .bg(p.card)
                         .text_xs()
                         .text_color(p.warn)
-                        .when(!rows.is_empty(), |el| el.border_t_1().border_color(divider))
                         .child(kit::icon(IconName::TriangleAlert, 12., p.warn))
                         .child(div().flex_1().child(format!(
                             "{id} is shared but not available on this machine right now."
@@ -1263,7 +1268,9 @@ impl QmtApp {
                         .into_any_element(),
                 );
             }
-            kit::card(p).children(rows).into_any_element()
+            // One block per provider: easier to tell apart than rows of a
+            // single card once several carry model limits.
+            v_flex().gap_2().children(rows).into_any_element()
         };
         v_flex()
             .gap_4()
@@ -1305,20 +1312,10 @@ impl QmtApp {
             }
         };
         let row_key = format!("{}/{pid}", peer.id);
+
+        // Header: who, which models, adding a model limit, and stopping
+        // the share, kept apart from the limit lines' own actions.
         let (m_peer, m_pid) = (peer.id.clone(), pid.clone());
-        let (r_peer, r_pid, r_order) = (peer.id.clone(), pid.clone(), order.to_vec());
-        let name = h_flex()
-            .w(px(150.))
-            .flex_none()
-            .gap_2()
-            .child(kit::provider_icon(&pid, 14., p.muted))
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .truncate()
-                    .child(pid.clone()),
-            );
         let models_btn = kit::flat_btn(
             kit::keyed("provider-models", row_key.clone()),
             !saving,
@@ -1336,79 +1333,14 @@ impl QmtApp {
                 this.open_models_modal(&m_peer, &m_pid, window, cx);
             }))
         });
-        let limit = self.quota_line(
-            agent,
-            peer,
-            &access.outgoing,
-            QuotaScope::provider(&pid),
-            true,
-            div().w_0(),
-            p,
-            window,
-            cx,
-        );
-        let remove = kit::row_icon_button(
-            kit::keyed("provider-remove", row_key.clone()),
-            IconName::X,
-            format!("Stop sharing {pid}"),
-            p,
-            cx,
-        )
-        .disabled(saving)
-        .on_click(cx.listener(move |this, _, _, cx| {
-            this.edit_draft(&r_peer, cx, |d| d.set_provider(&r_pid, false, &r_order));
-        }));
-        let head = h_flex()
-            .gap_3()
-            .min_h(px(44.))
-            .child(name)
-            .child(models_btn)
-            .child(div().flex_1().min_w_0().child(limit))
-            .child(remove);
-
-        // Single-model limits: only the models that have one, plus a menu to
-        // add one for any other model the peer may use.
+        // Models of this provider that have a limit of their own.
         let limited = |model: &str| {
             access
                 .outgoing
                 .quota(&QuotaScope::model(&pid, model))
                 .is_some_and(|q| q.limit != QuotaLimit::Unlimited)
         };
-        let editing_model = self.sharing.edit.as_ref().and_then(|e| {
-            (e.peer == peer.id && e.scope.provider_id == pid)
-                .then(|| e.scope.model_id.clone())
-                .flatten()
-        });
-        let mut model_lines: Vec<AnyElement> = Vec::new();
-        for m in &provider.models {
-            if !limited(&m.model_id) && editing_model.as_deref() != Some(m.model_id.as_str()) {
-                continue;
-            }
-            let label = div()
-                .w(px(190.))
-                .flex_none()
-                .min_w_0()
-                .truncate()
-                .font_family(kit::MONO)
-                .text_xs()
-                .text_color(if picked.contains(&m.model_id) {
-                    p.text
-                } else {
-                    p.muted
-                })
-                .child(m.model_id.clone());
-            model_lines.push(self.quota_line(
-                agent,
-                peer,
-                &access.outgoing,
-                QuotaScope::model(&pid, &m.model_id),
-                m.finite_quota_supported,
-                label,
-                p,
-                window,
-                cx,
-            ));
-        }
+        // Add a limit for any other model the peer may use.
         let limitable: Vec<String> = provider
             .models
             .iter()
@@ -1422,13 +1354,11 @@ impl QmtApp {
             let (peer_id, pid) = (peer.id.clone(), pid.clone());
             kit::flat_menu_btn(
                 kit::keyed("limit-model", row_key.clone()),
+                Some(IconName::Plus),
                 "Limit a model",
                 p,
                 cx,
             )
-            .icon(IconName::Gauge)
-            .h(px(26.))
-            .text_size(px(11.5))
             .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
                 for model in &limitable {
                     let (app, peer_id, scope) =
@@ -1444,6 +1374,113 @@ impl QmtApp {
                 menu
             })
         });
+        let (r_peer, r_pid, r_order) = (peer.id.clone(), pid.clone(), order.to_vec());
+        let stop = kit::row_icon_button(
+            kit::keyed("provider-remove", row_key.clone()),
+            IconName::Trash,
+            format!("Stop sharing {pid} with {}", peer.name),
+            p,
+            cx,
+        )
+        .label("Stop sharing")
+        .px_2()
+        .disabled(saving)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.edit_draft(&r_peer, cx, |d| d.set_provider(&r_pid, false, &r_order));
+        }));
+        let header = h_flex()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .bg(p.card_hover)
+            .border_b_1()
+            .border_color(divider)
+            .child(kit::provider_icon(&pid, 16., p.text))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(p.text)
+                    .child(pid.clone()),
+            )
+            .child(models_btn)
+            .children(add_limit)
+            .child(div().flex_1())
+            .child(stop);
+
+        // Body: one line per limit, all the same shape (scope, usage,
+        // actions). The provider's own limit comes first.
+        let scope_label = |text: String, mono: bool, color: Hsla| {
+            div()
+                .w(px(SCOPE_W))
+                .flex_none()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(color)
+                .map(|el| {
+                    if mono {
+                        el.font_family(kit::MONO)
+                    } else {
+                        el.font_medium()
+                    }
+                })
+                .child(text)
+        };
+        let mut lines: Vec<AnyElement> = vec![
+            self.quota_line(
+                agent,
+                peer,
+                &access.outgoing,
+                QuotaScope::provider(&pid),
+                true,
+                scope_label(
+                    if all {
+                        "All models"
+                    } else {
+                        "All shared models"
+                    }
+                    .to_string(),
+                    false,
+                    p.text,
+                ),
+                p,
+                window,
+                cx,
+            ),
+        ];
+
+        // Single-model limits: only the models that have one (or whose
+        // limit is being set now).
+        let editing_model = self.sharing.edit.as_ref().and_then(|e| {
+            (e.peer == peer.id && e.scope.provider_id == pid)
+                .then(|| e.scope.model_id.clone())
+                .flatten()
+        });
+        for m in &provider.models {
+            if !limited(&m.model_id) && editing_model.as_deref() != Some(m.model_id.as_str()) {
+                continue;
+            }
+            let color = if picked.contains(&m.model_id) {
+                p.text
+            } else {
+                p.muted
+            };
+            lines.push(self.quota_line(
+                agent,
+                peer,
+                &access.outgoing,
+                QuotaScope::model(&pid, &m.model_id),
+                m.finite_quota_supported,
+                scope_label(m.model_id.clone(), true, color),
+                p,
+                window,
+                cx,
+            ));
+        }
+
         // Chosen models this machine no longer lists.
         let gone: Vec<String> = match &selection {
             ModelSelection::Selected { model_ids } => model_ids
@@ -1453,38 +1490,44 @@ impl QmtApp {
                 .collect(),
             ModelSelection::All => Vec::new(),
         };
-        let details =
-            (!model_lines.is_empty() || add_limit.is_some() || !gone.is_empty()).then(|| {
-                v_flex()
-                    .pl(px(162.))
-                    .pb_2()
-                    .gap_1()
-                    .children(model_lines)
-                    .children(gone.into_iter().map(|g| {
-                        let (t_peer, t_pid, t_model) = (peer.id.clone(), pid.clone(), g.clone());
-                        h_flex()
-                            .id(kit::keyed("model-gone", format!("{row_key}/{g}")))
-                            .gap_2()
-                            .text_xs()
-                            .cursor_pointer()
-                            .child(kit::icon(IconName::TriangleAlert, 12., p.warn))
-                            .child(div().font_family(kit::MONO).child(g))
-                            .child(
-                                div()
-                                    .text_color(p.warn)
-                                    .child("not available here now · click to drop"),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.edit_draft(&t_peer, cx, |d| d.toggle_model(&t_pid, &t_model));
-                            }))
+        for g in gone {
+            let (t_peer, t_pid, t_model) = (peer.id.clone(), pid.clone(), g.clone());
+            lines.push(
+                h_flex()
+                    .id(kit::keyed("model-gone", format!("{row_key}/{g}")))
+                    .min_h(px(28.))
+                    .gap_2()
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(kit::icon(IconName::TriangleAlert, 12., p.warn))
+                    .child(div().font_family(kit::MONO).child(g))
+                    .child(
+                        div()
+                            .text_color(p.warn)
+                            .child("not available here now · click to drop"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edit_draft(&t_peer, cx, |d| d.toggle_model(&t_pid, &t_model));
                     }))
-                    .children(add_limit.map(|b| h_flex().child(b)))
-            });
+                    .into_any_element(),
+            );
+        }
+
+        let body = v_flex().children(lines.into_iter().enumerate().map(|(ix, line)| {
+            div()
+                .px_3()
+                .py_2()
+                .when(ix > 0, |el| el.border_t_1().border_color(divider))
+                .child(line)
+        }));
         v_flex()
-            .px_3()
-            .child(head)
-            .children(details)
-            .border_color(divider)
+            .rounded(px(10.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(p.border)
+            .bg(p.card)
+            .child(header)
+            .child(body)
     }
 
     fn open_models_modal(
@@ -1808,10 +1851,19 @@ impl QmtApp {
                 .child(div().flex_1().min_w_0().whitespace_normal().child(e))
         });
         if editing {
-            return v_flex()
-                .gap_1()
-                .child(self.quota_editor(agent, peer, &scope, busy, p, window, cx))
-                .children(error_el)
+            // Keep the scope label so the editor stays in the value column.
+            return h_flex()
+                .items_start()
+                .gap_2()
+                .child(label)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(self.quota_editor(agent, peer, &scope, busy, p, window, cx))
+                        .children(error_el),
+                )
                 .into_any_element();
         }
         let key = scope.key();
@@ -1902,48 +1954,63 @@ impl QmtApp {
                     })),
                 )
             })
+            // Less frequent actions of a limit in one menu; both apply now.
             .when(!busy && finite, |el| {
+                use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+                let app = cx.entity().downgrade();
                 let (a, peer_id, s) = (agent.to_string(), peer.id.clone(), scope.clone());
-                let (a2, peer_id2, s2) = (agent.to_string(), peer.id.clone(), scope.clone());
                 el.child(
                     kit::row_icon_button(
-                        kit::keyed("quota-reset", format!("{}-{key}", peer.id)),
-                        IconName::RotateCcw,
-                        "Reset usage: start a fresh allowance now",
+                        kit::keyed("quota-menu", format!("{}-{key}", peer.id)),
+                        IconName::Ellipsis,
+                        "Limit actions",
                         p,
                         cx,
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.sharing_write(
-                            &a,
-                            &peer_id,
-                            Op::Reset(s.clone()),
-                            Write::Reset(s.clone()),
-                            cx,
-                        )
-                    })),
-                )
-                .child(
-                    kit::row_icon_button(
-                        kit::keyed("quota-remove", format!("{}-{key}", peer.id)),
-                        IconName::X,
-                        "Remove the limit",
-                        p,
-                        cx,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.sharing_write(
-                            &a2,
-                            &peer_id2,
-                            Op::Quota(s2.clone()),
-                            Write::Quota {
-                                scope: s2.clone(),
-                                operation: access::QuotaOperation::Reconfigure,
-                                limit: QuotaLimit::Unlimited,
-                            },
-                            cx,
-                        )
-                    })),
+                    .dropdown_menu_with_anchor(
+                        Anchor::TopRight,
+                        move |menu, _, _| {
+                            let (app1, a1, p1, s1) =
+                                (app.clone(), a.clone(), peer_id.clone(), s.clone());
+                            let (app2, a2, p2, s2) =
+                                (app.clone(), a.clone(), peer_id.clone(), s.clone());
+                            menu.item(
+                                PopupMenuItem::new("Reset usage now")
+                                    .icon(Icon::new(IconName::RotateCcw))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = app1.update(cx, |this, cx| {
+                                            this.sharing_write(
+                                                &a1,
+                                                &p1,
+                                                Op::Reset(s1.clone()),
+                                                Write::Reset(s1.clone()),
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new("Remove limit")
+                                    .icon(Icon::new(IconName::X))
+                                    .on_click(move |_, _, cx| {
+                                        let _ = app2.update(cx, |this, cx| {
+                                            this.sharing_write(
+                                                &a2,
+                                                &p2,
+                                                Op::Quota(s2.clone()),
+                                                Write::Quota {
+                                                    scope: s2.clone(),
+                                                    operation: access::QuotaOperation::Reconfigure,
+                                                    limit: QuotaLimit::Unlimited,
+                                                },
+                                                cx,
+                                            )
+                                        });
+                                    }),
+                            )
+                        },
+                    ),
                 )
             });
         v_flex()
