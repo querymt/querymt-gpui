@@ -188,6 +188,7 @@ impl LogView {
         if self.built.as_ref() == Some(&built) {
             return;
         }
+        crate::telemetry::profile_zone!("QueryMT: Update filtered log list");
         match self.built.as_ref().filter(|old| built.extends(old)) {
             Some(old) => {
                 let old_last = old.last;
@@ -304,6 +305,7 @@ const SHOWN_BODY: usize = 64 * 1024;
 
 /// A message body as indented JSON, cut for display.
 fn pretty_body(body: &Body) -> String {
+    crate::telemetry::profile_zone!("QueryMT: Format RPC body for log viewer");
     let text = serde_json::from_str::<serde_json::Value>(&body.text)
         .ok()
         .and_then(|v| serde_json::to_string_pretty(&v).ok())

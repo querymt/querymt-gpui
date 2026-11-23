@@ -125,6 +125,7 @@ fn synthesized_diffs(call: &ToolCall) -> Vec<Diff> {
     if call.running() || call.failed() || !EDIT_TOOLS.contains(&name.as_str()) {
         return vec![];
     }
+    crate::telemetry::profile_zone!("QueryMT: Synthesize edit diffs", "{name}");
     let Some(input) = call.input.as_ref().filter(|v| v.is_object()) else {
         return vec![];
     };
@@ -237,8 +238,30 @@ pub struct ToolCall {
     pub child_session: Option<String>,
 }
 
+/// A tool call to change in place: copied first while the transcript's
+/// snapshot still shares it (the whole call: output, arguments, diffs).
+fn tool_mut(call: &mut std::sync::Arc<ToolCall>) -> &mut ToolCall {
+    if std::sync::Arc::strong_count(call) > 1 {
+        crate::telemetry::profile_zone!(
+            "QueryMT: Copy shared tool call",
+            "{} output bytes",
+            call.output.len()
+        );
+        crate::telemetry::profiler::count(crate::telemetry::profiler::Count::ToolCallCopy);
+        return std::sync::Arc::make_mut(call);
+    }
+    std::sync::Arc::make_mut(call)
+}
+
 /// Line counts of a diff: (added, removed).
 pub fn diff_stats(d: &Diff) -> (usize, usize) {
+    crate::telemetry::profile_zone!(
+        "QueryMT: Count diff lines",
+        "{}, {} -> {} bytes",
+        d.path,
+        d.old.as_ref().map_or(0, String::len),
+        d.new.len()
+    );
     let old = d.old.clone().unwrap_or_default();
     let diff = similar::TextDiff::from_lines(&old, &d.new);
     let (mut adds, mut dels) = (0usize, 0usize);
@@ -276,6 +299,11 @@ impl OutputFacts {
         if !trimmed.starts_with('{') {
             return Self::default();
         }
+        crate::telemetry::profile_zone!(
+            "QueryMT: Parse shell tool output",
+            "{} bytes",
+            output.len()
+        );
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             return Self::default();
         };
@@ -659,6 +687,7 @@ enum CompactionAnchor {
 /// with the transcript item it followed. Legacy records without an id pair
 /// their terminal with the latest open start, like the desktop app.
 fn fold_compactions(events: &[Value]) -> Vec<(Option<CompactionAnchor>, Compaction)> {
+    crate::telemetry::profile_zone!("QueryMT: Fold compaction events", "{} events", events.len());
     let mut out: Vec<(Option<CompactionAnchor>, Compaction)> = Vec::new();
     let mut anchor: Option<CompactionAnchor> = None;
     let mut used: Option<u64> = None;
@@ -1236,6 +1265,13 @@ impl SessionView {
         folded: Vec<(Option<CompactionAnchor>, Compaction)>,
         history_complete: bool,
     ) {
+        // Each insertion reindexes every tool call.
+        crate::telemetry::profile_zone!(
+            "QueryMT: Insert compactions",
+            "{} compactions into {} items",
+            folded.len(),
+            self.items.len()
+        );
         for (anchor, mut compaction) in folded {
             let key = format!("compaction-{}", compaction.id);
             // A replayed `compaction_update` arrives before the conversation it
@@ -1290,6 +1326,11 @@ impl SessionView {
     }
 
     fn reindex_tools(&mut self) {
+        crate::telemetry::profile_zone!(
+            "QueryMT: Reindex tool calls",
+            "{} items",
+            self.items.len()
+        );
         self.tool_index.clear();
         for (ix, item) in self.items.iter().enumerate() {
             if let ItemKind::Work(entries) = &item.kind {
@@ -1455,6 +1496,7 @@ impl SessionView {
     /// in first-touched order, each tool's change kept apart because
     /// successive edits don't share one baseline.
     pub fn turn_diffs(&self, range: std::ops::Range<usize>) -> Vec<TurnDiffFile> {
+        crate::telemetry::profile_zone!("QueryMT: Collect turn diffs");
         let mut files: Vec<TurnDiffFile> = Vec::new();
         for item in &self.items[range] {
             let ItemKind::Work(entries) = &item.kind else {
@@ -1520,6 +1562,7 @@ impl SessionView {
     /// audit's request usage and active time, and (for a windowed load with
     /// older history) the summary's whole-session totals.
     pub fn apply_load_snapshot(&mut self, snap: &Value) {
+        crate::telemetry::profile_zone!("QueryMT: Apply session snapshot");
         if let Some(a) = Accounting::read(snap.get("accounting")) {
             self.accounting = Some(a);
         }
@@ -1716,6 +1759,7 @@ impl SessionView {
     /// Prepend an older-history page (raw agent events, ascending) to the
     /// transcript, projecting them the way the agent's replay does.
     pub fn prepend_events(&mut self, events: &[Value], prompts: &[Value]) {
+        crate::telemetry::profile_zone!("QueryMT: Prepend older history");
         let mut older = SessionView {
             counter: self.counter,
             child_links: std::mem::take(&mut self.child_links),
@@ -1755,6 +1799,7 @@ impl SessionView {
     /// reasoning, tool calls and the todo plan. Structured prompts with no
     /// `prompt_received` event (e.g. steering) are placed by timestamp.
     pub fn apply_history_events(&mut self, events: &[Value], prompts: &[Value]) {
+        crate::telemetry::profile_zone!("QueryMT: Replay session history");
         let mut structured: Vec<(u64, String, i64, &[Value])> = prompts
             .iter()
             .filter_map(|p| {
@@ -1964,6 +2009,7 @@ impl SessionView {
 
     /// The run is over: tools still marked running never got a result.
     fn fail_unfinished_tools(&mut self) {
+        crate::telemetry::profile_zone!("QueryMT: Fail unfinished tool calls");
         for ix in 0..self.items.len() {
             let mut changed = false;
             if let ItemKind::Work(entries) = &mut self.items[ix].kind {
@@ -1971,7 +2017,7 @@ impl SessionView {
                     if let WorkEntry::Tool(call) = e
                         && call.running()
                     {
-                        let call = std::sync::Arc::make_mut(call);
+                        let call = tool_mut(call);
                         call.status = "failed".into();
                         if call.output.is_empty() {
                             call.set_output("Run ended before a tool result was recorded.".into());
@@ -2000,7 +2046,7 @@ impl SessionView {
                     && call.id == tool_call_id
                     && call.child_session.as_deref() != Some(child)
                 {
-                    std::sync::Arc::make_mut(call).child_session = Some(child.to_string());
+                    tool_mut(call).child_session = Some(child.to_string());
                     changed = true;
                 }
             }
@@ -2141,7 +2187,7 @@ impl SessionView {
             return;
         };
         let Some(call) = entries.iter_mut().find_map(|e| match e {
-            WorkEntry::Tool(c) if c.id == id => Some(std::sync::Arc::make_mut(c)),
+            WorkEntry::Tool(c) if c.id == id => Some(tool_mut(c)),
             _ => None,
         }) else {
             return;
@@ -2734,6 +2780,14 @@ impl SessionView {
         let Some(id) = update.get("toolCallId").and_then(Value::as_str) else {
             return;
         };
+        crate::telemetry::profile_zone!(
+            "QueryMT: Apply tool call update",
+            "{id} {}",
+            update
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        );
         let ix = match self.tool_index.get(id).copied() {
             Some(ix) => ix,
             None if created || !self.tool_index.contains_key(id) => {
@@ -2766,7 +2820,7 @@ impl SessionView {
             return;
         };
         let Some(call) = entries.iter_mut().find_map(|e| match e {
-            WorkEntry::Tool(c) if c.id == id => Some(std::sync::Arc::make_mut(c)),
+            WorkEntry::Tool(c) if c.id == id => Some(tool_mut(c)),
             _ => None,
         }) else {
             return;

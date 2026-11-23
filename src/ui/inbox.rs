@@ -959,6 +959,11 @@ impl QmtApp {
                 )
                 .into_any_element()
         } else {
+            crate::telemetry::profile_zone!(
+                "QueryMT: Build inbox request cards",
+                "{} requests",
+                keys.len()
+            );
             let cards: Vec<AnyElement> = keys
                 .iter()
                 .enumerate()

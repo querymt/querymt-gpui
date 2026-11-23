@@ -41,6 +41,37 @@ System graphics/windowing libraries are still required; this is not a fully stat
 portable Linux binary. Size optimization can reduce peak throughput; use debug
 builds when you need symbols and panic backtraces.
 
+### Profile With Tracy
+
+```bash
+nix develop -c cargo run --features tracy
+```
+
+Connect with the Tracy **0.13.1** viewer (other versions report an incompatible
+protocol):
+
+```bash
+nix shell --inputs-from . nixpkgs#tracy -c env -u LD_LIBRARY_PATH tracy -a 127.0.0.1
+```
+
+The client listens on `127.0.0.1:8086` and records only while connected:
+`QueryMT:` zones, plots and messages, and heap allocations (**Memory**
+window). Add `--features tracy-memory-callstacks` for allocation call stacks.
+
+For an optimized build with symbols:
+
+```bash
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
+  nix develop -c cargo run --release --features tracy
+```
+
+To save a 15-second capture instead:
+
+```bash
+nix shell --inputs-from . nixpkgs#tracy -c env -u LD_LIBRARY_PATH \
+  tracy-capture -a 127.0.0.1 -o querymt.tracy -s 15
+```
+
 ## Web
 
 ```bash

@@ -28,8 +28,27 @@ use std::borrow::Cow;
 
 use gpui_kit::*;
 
+/// Report every heap allocation to Tracy (its Memory window and memory
+/// plot). On-demand mode drops events while no profiler is connected, so
+/// the Memory window covers what happened since connecting.
+#[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+#[global_allocator]
+static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
+    tracy_client::ProfiledAllocator::new(std::alloc::System, ALLOC_CALLSTACK_DEPTH);
+
+/// Frames recorded per allocation: callstacks show where memory comes from
+/// but slow every allocation down, so they are a separate feature.
+#[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+const ALLOC_CALLSTACK_DEPTH: u16 = if cfg!(feature = "tracy-memory-callstacks") {
+    24
+} else {
+    0
+};
+
 #[cfg(not(target_family = "wasm"))]
 fn main() {
+    #[cfg(feature = "tracy")]
+    tracy_client::Client::start().set_thread_name("QueryMT UI");
     telemetry::init();
     let app = gpui_kit::application().with_assets(AppAssets(gpui_kit::assets::AllAssets));
     run(app);

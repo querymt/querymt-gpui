@@ -857,6 +857,7 @@ fn form_fields(
     allow_custom: bool,
     hoisted: Option<&Value>,
 ) -> Option<Vec<FormField>> {
+    crate::telemetry::profile_zone!("QueryMT: Parse elicitation form");
     let required: Vec<&str> = schema
         .get("required")
         .and_then(Value::as_array)
@@ -933,6 +934,7 @@ fn parse_request(
             .collect();
         // Reuse the transcript's tool parsing for the command / path preview.
         let summary = {
+            crate::telemetry::profile_zone!("QueryMT: Summarize permission tool call");
             let mut call = crate::session::SessionView::default();
             let mut update = tool.clone();
             if let Some(obj) = update.as_object_mut() {
@@ -1623,6 +1625,7 @@ fn save_persisted(state: &Persisted) {
     if cfg!(test) {
         return;
     }
+    crate::telemetry::profile_zone!("QueryMT: Save app state");
     let Ok(text) = serde_json::to_string_pretty(state) else {
         return;
     };
@@ -2663,13 +2666,21 @@ impl AgentsStore {
                 let (rpc, id, this, incoming) = (rpc.clone(), id.clone(), this.clone(), conn.incoming);
                 cx.spawn(async move |cx| {
                     while let Ok(inbound) = incoming.recv().await {
+                        // Messages still queued behind this one: a growing
+                        // backlog means the UI thread can't keep up.
+                        crate::telemetry::profile_plot!("QueryMT: inbound queue depth", incoming.len());
                         match inbound {
                             Inbound::Message(text) => {
+                                crate::telemetry::profile_zone!("QueryMT: Handle inbound message", "{} bytes", text.len());
+                                crate::telemetry::profiler::count(crate::telemetry::profiler::Count::InboundMessage);
+                                crate::telemetry::profile_plot!("QueryMT: inbound message bytes", text.len());
                                 if let Some(incoming) = rpc.handle(&text) {
                                     let _ = this.update(cx, |s, cx| s.on_incoming(&id, generation, incoming, cx));
                                 }
                             }
                             Inbound::Log(line) => {
+                                crate::telemetry::profile_zone!("QueryMT: Record agent log line");
+                                crate::telemetry::profiler::count(crate::telemetry::profiler::Count::AgentLog);
                                 let _ = this.update(cx, |s, cx| {
                                     if let Some(rt) = s.live(&id, generation) {
                                         rt.log_agent(&line);
@@ -2708,6 +2719,7 @@ impl AgentsStore {
                 rpc.close();
                 return;
             }
+            crate::telemetry::profile_message!("Agent {id} transport connected");
 
             let init = rpc
                 .request(
@@ -4417,6 +4429,7 @@ impl AgentsStore {
             rpc.close();
         }
         rt.log_error(format!("Error: {reason}"));
+        crate::telemetry::profile_message!("Agent {id} connection lost: {reason}");
         rt.state = ConnState::Failed(reason);
         rt.busy = false;
         self.retire_requests(id);
@@ -4440,6 +4453,11 @@ impl AgentsStore {
         };
         let delay = reconnect_delay(rt.reconnect_attempt);
         rt.reconnect_attempt += 1;
+        crate::telemetry::profile_message!(
+            "Agent {id} reconnect {} scheduled in {:.1} s",
+            rt.reconnect_attempt,
+            delay.as_secs_f32()
+        );
         rt.log_warn(format!(
             "Reconnecting in {:.1}s (attempt {})…",
             delay.as_secs_f32(),
@@ -4473,10 +4491,15 @@ impl AgentsStore {
                 method,
                 params,
             } => {
+                crate::telemetry::profile_zone!("QueryMT: Dispatch agent request", "{method}");
                 let Some(rpc) = self.live(id, generation).and_then(|rt| rt.rpc.clone()) else {
                     return;
                 };
-                match parse_request(id, request_id.clone(), &method, &params) {
+                let parsed = {
+                    crate::telemetry::profile_zone!("QueryMT: Parse agent request");
+                    parse_request(id, request_id.clone(), &method, &params)
+                };
+                match parsed {
                     Some(request) => self.receive_request(request, cx),
                     None => rpc.respond(
                         request_id,
@@ -4488,6 +4511,7 @@ impl AgentsStore {
                 }
             }
             Incoming::Notification { method, params } => {
+                crate::telemetry::profile_zone!("QueryMT: Dispatch notification", "{method}");
                 if method == "session/update" {
                     let session_id = params
                         .get("sessionId")
@@ -4499,6 +4523,14 @@ impl AgentsStore {
                         .filter(|v| v.agent_id == id && v.session_id == session_id)
                         && let Some(update) = params.get("update")
                     {
+                        crate::telemetry::profile_zone!(
+                            "QueryMT: Apply live session update",
+                            "{}",
+                            update
+                                .get("sessionUpdate")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                        );
                         view.apply(update);
                         cx.notify();
                     }
@@ -4660,6 +4692,10 @@ impl AgentsStore {
                 match sessions {
                     Ok(fresh) => {
                         merge_sessions(rt, fresh);
+                        crate::telemetry::profile_plot!(
+                            "QueryMT: catalog sessions",
+                            rt.sessions.len()
+                        );
                         rt.sessions_loaded = true;
                         rt.sessions_error = None;
                     }
@@ -4694,6 +4730,12 @@ fn root_scope(remote_nodes: &[String]) -> Value {
 /// Merge listed sessions into `rt`, newest first; listed entries replace
 /// the known ones of the same id.
 fn merge_sessions(rt: &mut AgentRuntime, listed: Vec<SessionSummary>) {
+    crate::telemetry::profile_zone!(
+        "QueryMT: Merge session catalog page",
+        "{} listed into {}",
+        listed.len(),
+        rt.sessions.len()
+    );
     let ids: std::collections::HashSet<String> = listed.iter().map(|s| s.id.clone()).collect();
     let mut merged = listed;
     merged.extend(rt.sessions.drain(..).filter(|s| !ids.contains(&s.id)));
@@ -4744,6 +4786,7 @@ async fn fetch_session_page(
             page.cursor = cursor.is_some()
         ))
         .await?;
+    crate::telemetry::profile_zone!("QueryMT: Convert session catalog page");
     let sessions = page
         .get("sessions")
         .and_then(Value::as_array)

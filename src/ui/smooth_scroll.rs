@@ -493,6 +493,7 @@ impl SmoothScroll {
     }
 
     fn tick(state: Rc<RefCell<State>>, window: &mut Window, cx: &mut App) {
+        crate::telemetry::profile_zone!("QueryMT: Smooth scroll tick");
         let now = cx.background_executor().now();
         let step = {
             let mut s = state.borrow_mut();

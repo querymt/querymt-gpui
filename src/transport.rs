@@ -90,8 +90,13 @@ mod native {
         in_tx: Sender<Inbound>,
         ready: futures::channel::oneshot::Sender<Result<(), String>>,
     ) {
+        crate::telemetry::profiler::thread("QueryMT WebSocket");
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut socket = match tungstenite::connect(url.as_str()) {
+        let connected = {
+            crate::telemetry::profile_zone!("QueryMT: Open WebSocket");
+            tungstenite::connect(url.as_str())
+        };
+        let mut socket = match connected {
             Ok((socket, _)) => socket,
             Err(err) => {
                 let _ = ready.send(Err(format!("Unable to connect to {url}: {err}")));
@@ -111,6 +116,13 @@ mod native {
             loop {
                 match out_rx.try_recv() {
                     Ok(text) => {
+                        // Outgoing frames wait for the read timeout below
+                        // (up to 15 ms) before they get here.
+                        crate::telemetry::profile_zone!(
+                            "QueryMT: Send WebSocket frame",
+                            "{} bytes",
+                            text.len()
+                        );
                         if let Err(err) = socket.send(Message::Text(text.into())) {
                             let _ = in_tx.send_blocking(Inbound::Closed(format!(
                                 "WebSocket send failed: {err}"
@@ -128,6 +140,11 @@ mod native {
             }
             match socket.read() {
                 Ok(Message::Text(text)) => {
+                    crate::telemetry::profile_zone!(
+                        "QueryMT: Receive WebSocket frame",
+                        "{} bytes",
+                        text.len()
+                    );
                     if in_tx
                         .send_blocking(Inbound::Message(text.as_str().to_owned()))
                         .is_err()
@@ -190,38 +207,59 @@ mod native {
         )));
 
         let tx = in_tx.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                match line {
-                    Ok(line) if line.trim().is_empty() => {}
-                    Ok(line) => {
-                        if tx.send_blocking(Inbound::Message(line)).is_err() {
-                            return;
+        let thread = |name: &str| std::thread::Builder::new().name(name.into());
+        let spawn_failed = |e: std::io::Error| format!("Failed to start an agent I/O thread: {e}");
+        thread("qmt-agent-stdout")
+            .spawn(move || {
+                crate::telemetry::profiler::thread("QueryMT agent stdout");
+                for line in BufReader::new(stdout).lines() {
+                    match line {
+                        Ok(line) if line.trim().is_empty() => {}
+                        Ok(line) => {
+                            crate::telemetry::profile_zone!(
+                                "QueryMT: Receive agent stdout line",
+                                "{} bytes",
+                                line.len()
+                            );
+                            if tx.send_blocking(Inbound::Message(line)).is_err() {
+                                return;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-            let _ = tx.send_blocking(Inbound::Closed("Agent process exited.".into()));
-        });
+                let _ = tx.send_blocking(Inbound::Closed("Agent process exited.".into()));
+            })
+            .map_err(spawn_failed)?;
         let tx = in_tx;
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                let _ = tx.send_blocking(Inbound::Log(line));
-            }
-        });
-        std::thread::spawn(move || {
-            while let Ok(line) = out_rx.recv_blocking() {
-                if writeln!(stdin, "{line}")
-                    .and_then(|_| stdin.flush())
-                    .is_err()
-                {
-                    break;
+        thread("qmt-agent-stderr")
+            .spawn(move || {
+                crate::telemetry::profiler::thread("QueryMT agent stderr");
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let _ = tx.send_blocking(Inbound::Log(line));
                 }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+            })
+            .map_err(spawn_failed)?;
+        thread("qmt-agent-stdin")
+            .spawn(move || {
+                crate::telemetry::profiler::thread("QueryMT agent stdin");
+                while let Ok(line) = out_rx.recv_blocking() {
+                    crate::telemetry::profile_zone!(
+                        "QueryMT: Write agent stdin line",
+                        "{} bytes",
+                        line.len()
+                    );
+                    if writeln!(stdin, "{line}")
+                        .and_then(|_| stdin.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            })
+            .map_err(spawn_failed)?;
         Ok(pid)
     }
 

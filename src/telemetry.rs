@@ -20,6 +20,207 @@
 
 #![cfg_attr(target_family = "wasm", allow(dead_code))]
 
+/// Time a synchronous scope in Tracy. The second form attaches text to the
+/// zone (`format!` arguments), formatted only while a profiler is connected.
+/// Without the `tracy` feature neither form evaluates anything.
+macro_rules! profile_zone {
+    ($name:literal) => {
+        #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+        profiling::scope!($name);
+    };
+    ($name:literal, $($text:tt)+) => {
+        #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+        let _qmt_zone = {
+            let zone = tracy_client::Client::running()
+                .map(|client| client.span(tracy_client::span_location!($name), 0));
+            if let Some(zone) = &zone
+                && $crate::telemetry::profiler::connected()
+            {
+                zone.emit_text(&format!($($text)+));
+            }
+            zone
+        };
+    };
+}
+pub(crate) use profile_zone;
+
+/// Add a point to a Tracy plot (any numeric value).
+macro_rules! profile_plot {
+    ($name:literal, $value:expr) => {
+        #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+        let () =
+            $crate::telemetry::profiler::plot(tracy_client::plot_name!($name), ($value) as f64);
+    };
+}
+pub(crate) use profile_plot;
+
+/// Put a message on the Tracy timeline (`format!` arguments), formatted only
+/// while a profiler is connected.
+macro_rules! profile_message {
+    ($($text:tt)+) => {
+        #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+        let () = $crate::telemetry::profiler::message(|| format!($($text)+));
+    };
+}
+pub(crate) use profile_message;
+
+/// Tracy helpers behind the macros above, plus event counters plotted once
+/// per app build. Without the `tracy` feature every function is a no-op.
+pub mod profiler {
+    /// Events counted between app builds; each is plotted as
+    /// `QueryMT: <name> per app build`.
+    #[derive(Clone, Copy)]
+    #[cfg_attr(
+        not(all(feature = "tracy", not(target_family = "wasm"))),
+        allow(dead_code)
+    )]
+    pub enum Count {
+        /// The store notified its observers.
+        StoreNotify,
+        /// An inbound JSON-RPC message was handled on the UI thread.
+        InboundMessage,
+        /// An agent stderr line reached the store.
+        AgentLog,
+        /// A spinner clock ticked (33 ms while a spinner is shown).
+        SpinnerTick,
+        /// A one-second duration clock ticked.
+        SecondTick,
+        /// A finished Markdown parse forced a window refresh.
+        MarkdownRefresh,
+        /// Highlight span cache lookups.
+        HighlightHit,
+        HighlightMiss,
+        /// A tool call was cloned because the transcript still shared it.
+        ToolCallCopy,
+        /// A transcript row was remeasured after its content changed.
+        Remeasure,
+        /// The session composer's text changed (a keystroke or paste).
+        ComposerInput,
+        /// A user image attachment was decoded from base64.
+        ImageDecode,
+    }
+
+    #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+    mod imp {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::Count;
+
+        const COUNTS: usize = Count::ImageDecode as usize + 1;
+        static COUNTERS: [AtomicU64; COUNTS] = [const { AtomicU64::new(0) }; COUNTS];
+
+        /// Whether a profiler is attached (on-demand mode records nothing before).
+        pub fn connected() -> bool {
+            // SAFETY: plain query of the client's connection flag; the client
+            // is started in `main` before any instrumented code runs.
+            tracy_client::Client::is_running()
+                && unsafe { tracy_client::sys::___tracy_connected() != 0 }
+        }
+
+        pub fn plot(name: tracy_client::PlotName, value: f64) {
+            if let Some(client) = tracy_client::Client::running() {
+                client.plot(name, value);
+            }
+        }
+
+        pub fn message(text: impl FnOnce() -> String) {
+            if connected()
+                && let Some(client) = tracy_client::Client::running()
+            {
+                client.message(&text(), 0);
+            }
+        }
+
+        /// Name the current thread in Tracy.
+        pub fn thread(name: &str) {
+            if let Some(client) = tracy_client::Client::running() {
+                client.set_thread_name(name);
+            }
+        }
+
+        pub fn count(what: Count) {
+            COUNTERS[what as usize].fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// Plot and reset the event counters; called once per app build.
+        pub fn flush_counts() {
+            let Some(client) = tracy_client::Client::running() else {
+                return;
+            };
+            let take = |what: Count| COUNTERS[what as usize].swap(0, Ordering::Relaxed) as f64;
+            use tracy_client::plot_name;
+            for (what, name) in [
+                (
+                    Count::StoreNotify,
+                    plot_name!("QueryMT: store notifications per app build"),
+                ),
+                (
+                    Count::InboundMessage,
+                    plot_name!("QueryMT: inbound messages per app build"),
+                ),
+                (
+                    Count::AgentLog,
+                    plot_name!("QueryMT: agent log lines per app build"),
+                ),
+                (
+                    Count::SpinnerTick,
+                    plot_name!("QueryMT: spinner ticks per app build"),
+                ),
+                (
+                    Count::SecondTick,
+                    plot_name!("QueryMT: duration clock ticks per app build"),
+                ),
+                (
+                    Count::MarkdownRefresh,
+                    plot_name!("QueryMT: Markdown parse refreshes per app build"),
+                ),
+                (
+                    Count::HighlightHit,
+                    plot_name!("QueryMT: highlight cache hits per app build"),
+                ),
+                (
+                    Count::HighlightMiss,
+                    plot_name!("QueryMT: highlight cache misses per app build"),
+                ),
+                (
+                    Count::ToolCallCopy,
+                    plot_name!("QueryMT: tool call copies per app build"),
+                ),
+                (
+                    Count::Remeasure,
+                    plot_name!("QueryMT: transcript rows remeasured per app build"),
+                ),
+                (
+                    Count::ComposerInput,
+                    plot_name!("QueryMT: composer edits per app build"),
+                ),
+                (
+                    Count::ImageDecode,
+                    plot_name!("QueryMT: image decodes per app build"),
+                ),
+            ] {
+                client.plot(name, take(what));
+            }
+        }
+    }
+    #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+    pub use imp::*;
+
+    #[cfg(not(all(feature = "tracy", not(target_family = "wasm"))))]
+    mod imp {
+        use super::Count;
+
+        #[inline(always)]
+        pub fn thread(_: &str) {}
+        #[inline(always)]
+        pub fn count(_: Count) {}
+        #[inline(always)]
+        pub fn flush_counts() {}
+    }
+    #[cfg(not(all(feature = "tracy", not(target_family = "wasm"))))]
+    pub use imp::*;
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub use native::*;
 
@@ -27,6 +228,9 @@ pub use native::*;
 #[cfg(target_family = "wasm")]
 mod web {
     pub fn enabled() -> bool {
+        false
+    }
+    pub fn probing() -> bool {
         false
     }
     pub fn record_step(_: f64) {}
@@ -46,6 +250,7 @@ static SESSION_OPEN: std::sync::Mutex<Option<(String, f64)>> = std::sync::Mutex:
 
 /// A session open started (click → `session/load`).
 pub fn mark_session_open(session_id: &str) {
+    profile_message!("Session open: {session_id}");
     if let Ok(mut open) = SESSION_OPEN.lock() {
         *open = Some((session_id.to_string(), crate::util::now_ms()));
     }
@@ -61,6 +266,9 @@ pub fn session_rendered(session_id: &str, items: usize) {
         && id == session_id
     {
         let elapsed = crate::util::now_ms() - started;
+        profile_message!(
+            "Session first render: {session_id}, {items} items, {elapsed:.0} ms after open"
+        );
         tracing::info!(
             session.open_to_render_ms = elapsed,
             session.items = items,
@@ -107,6 +315,16 @@ mod native {
     /// checks this first, so the default build pays nothing.
     pub fn enabled() -> bool {
         ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Whether per-frame probes (row and frame timing, scroll sampling) run:
+    /// while exporting, or while a Tracy profiler is connected.
+    pub fn probing() -> bool {
+        #[cfg(feature = "tracy")]
+        if super::profiler::connected() {
+            return true;
+        }
+        enabled()
     }
 
     /// Resolved settings: `Some(endpoint)` when export is requested.
@@ -384,18 +602,23 @@ mod native {
         record(|m| m.shift.record(px, &[]));
     }
     pub fn record_jump(kind: &'static str) {
+        profile_message!("Transcript scroll jump: {kind}");
         record(|m| m.jumps.add(1, &[KeyValue::new("kind", kind)]));
     }
     pub fn record_follow_engaged() {
         record(|m| m.follow_engaged.add(1, &[]));
     }
     pub fn record_remeasure() {
+        crate::telemetry::profiler::count(crate::telemetry::profiler::Count::Remeasure);
         record(|m| m.remeasure.add(1, &[]));
     }
     pub fn record_history_load(outcome: &'static str) {
+        profile_message!("Older history page: {outcome}");
         record(|m| m.history_loads.add(1, &[KeyValue::new("outcome", outcome)]));
     }
     pub fn record_frame(ms: f64, rows: usize) {
+        profile_plot!("QueryMT: transcript frame ms", ms);
+        profile_plot!("QueryMT: transcript rows built per frame", rows);
         record(|m| {
             m.frame_ms.record(ms, &[]);
             m.frame_rows.record(rows as u64, &[]);

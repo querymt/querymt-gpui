@@ -136,6 +136,7 @@ fn is_loopback(address: &str) -> bool {
 
 #[cfg(not(target_family = "wasm"))]
 fn list_dirs(base: &str) -> Vec<String> {
+    crate::telemetry::profile_zone!("QueryMT: List workspace directories");
     let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
     };

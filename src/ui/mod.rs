@@ -383,6 +383,8 @@ impl QmtApp {
 
         let mut subs = vec![
             cx.observe(&store, |this, store, cx| {
+                crate::telemetry::profile_zone!("QueryMT: React to store change");
+                crate::telemetry::profiler::count(crate::telemetry::profiler::Count::StoreNotify);
                 // Drop inputs of requests that left the inbox.
                 let s = store.read(cx);
                 this.form_inputs
@@ -422,6 +424,10 @@ impl QmtApp {
             ),
             cx.subscribe_in(&session_prompt, window, |_, _, ev: &InputEvent, _, cx| {
                 if matches!(ev, InputEvent::Change) {
+                    // Every keystroke rebuilds the whole app view.
+                    crate::telemetry::profiler::count(
+                        crate::telemetry::profiler::Count::ComposerInput,
+                    );
                     cx.notify();
                 }
             }),
@@ -922,6 +928,7 @@ impl QmtApp {
     }
 
     fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        crate::telemetry::profile_zone!("QueryMT: Build sidebar");
         // The right-click menu floats over everything; it lives here so it
         // shows on every page.
         let menu = self.render_side_menu(cx);
@@ -1148,6 +1155,9 @@ fn initial_view(store: &Entity<AgentsStore>, cx: &App) -> (Page, Option<String>)
 
 impl Render for QmtApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::telemetry::profile_zone!("QueryMT: Build app view", "{:?}", self.page);
+        // What happened since the previous build: the causes of this one.
+        crate::telemetry::profiler::flush_counts();
         let p = *palette(cx);
         let render_started = crate::util::now_ms();
         // Sessions that came and went since the last frame take or leave
@@ -1156,54 +1166,88 @@ impl Render for QmtApp {
         if self.side.drop_target.is_some() && !cx.has_active_drag() {
             self.side.drop_target = None;
         }
+        // Sessions and Session time themselves (with sub-zones).
         let body = match self.page {
-            Page::Start => self.render_start(cx).into_any_element(),
+            Page::Start => {
+                crate::telemetry::profile_zone!("QueryMT: Build start page");
+                self.render_start(cx).into_any_element()
+            }
             Page::Sessions => self.render_sessions(cx).into_any_element(),
-            Page::Agents => self.render_agents(cx).into_any_element(),
-            Page::Mesh => self.render_mesh(window, cx).into_any_element(),
-            Page::Automations => self.render_automations(cx).into_any_element(),
-            Page::Settings => self.render_settings(cx).into_any_element(),
-            Page::Inbox => self.render_inbox(window, cx).into_any_element(),
+            Page::Agents => {
+                crate::telemetry::profile_zone!("QueryMT: Build agents page");
+                self.render_agents(cx).into_any_element()
+            }
+            Page::Mesh => {
+                crate::telemetry::profile_zone!("QueryMT: Build mesh page");
+                self.render_mesh(window, cx).into_any_element()
+            }
+            Page::Automations => {
+                crate::telemetry::profile_zone!("QueryMT: Build automations page");
+                self.render_automations(cx).into_any_element()
+            }
+            Page::Settings => {
+                crate::telemetry::profile_zone!("QueryMT: Build settings page");
+                self.render_settings(cx).into_any_element()
+            }
+            Page::Inbox => {
+                crate::telemetry::profile_zone!("QueryMT: Build inbox page");
+                self.render_inbox(window, cx).into_any_element()
+            }
             Page::Session => self.render_session(window, cx).into_any_element(),
-            Page::Setup => self.render_setup(cx).into_any_element(),
-            Page::Workspaces => self.render_workspaces(cx).into_any_element(),
+            Page::Setup => {
+                crate::telemetry::profile_zone!("QueryMT: Build setup page");
+                self.render_setup(cx).into_any_element()
+            }
+            Page::Workspaces => {
+                crate::telemetry::profile_zone!("QueryMT: Build workspaces page");
+                self.render_workspaces(cx).into_any_element()
+            }
         };
         let setup = self.page == Page::Setup;
         let radii = gpui_kit::component::window_corner_radii(window, cx);
         // Full-window scrims must round themselves: GPUI's overflow mask is
         // rectangular, so the frame's `overflow_hidden` can't clip their corners.
-        let overlay = self
-            .render_preview(radii, window, cx)
-            .or_else(|| self.render_palette(radii, cx))
-            .or_else(|| self.render_log_view(radii, window, cx))
-            .or_else(|| {
-                (self.page == Page::Session)
-                    .then(|| self.render_delegate_dialog(radii, cx))
-                    .flatten()
-            })
-            .or_else(|| {
-                (self.page == Page::Session)
-                    .then(|| self.render_fork_dialog(radii, cx))
-                    .flatten()
-            })
-            .or_else(|| {
-                (self.page == Page::Session)
-                    .then(|| self.render_worktree_dialog(radii, window, cx))
-                    .flatten()
-            })
-            .or_else(|| self.render_model_modal(radii, cx))
-            .or_else(|| {
-                (self.page == Page::Mesh)
-                    .then(|| self.render_share_models_modal(radii, cx))
-                    .flatten()
-            })
-            .or_else(|| self.render_automation_overlay(radii, cx))
-            .or_else(|| self.render_workspace_overlay(radii, cx))
-            .or_else(|| self.render_overlay(radii, cx));
-        let header = self.render_header(window, cx).into_any_element();
+        let overlay = {
+            crate::telemetry::profile_zone!("QueryMT: Build overlays");
+            self.render_preview(radii, window, cx)
+                .or_else(|| self.render_palette(radii, cx))
+                .or_else(|| self.render_log_view(radii, window, cx))
+                .or_else(|| {
+                    (self.page == Page::Session)
+                        .then(|| self.render_delegate_dialog(radii, cx))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (self.page == Page::Session)
+                        .then(|| self.render_fork_dialog(radii, cx))
+                        .flatten()
+                })
+                .or_else(|| {
+                    (self.page == Page::Session)
+                        .then(|| self.render_worktree_dialog(radii, window, cx))
+                        .flatten()
+                })
+                .or_else(|| self.render_model_modal(radii, cx))
+                .or_else(|| {
+                    (self.page == Page::Mesh)
+                        .then(|| self.render_share_models_modal(radii, cx))
+                        .flatten()
+                })
+                .or_else(|| self.render_automation_overlay(radii, cx))
+                .or_else(|| self.render_workspace_overlay(radii, cx))
+                .or_else(|| self.render_overlay(radii, cx))
+        };
+        let header = {
+            crate::telemetry::profile_zone!("QueryMT: Build title bar");
+            self.render_header(window, cx).into_any_element()
+        };
         let render_ms = crate::util::now_ms() - render_started;
         if render_ms > 16. {
             tracing::warn!(render.ms = render_ms, "slow app render");
+            crate::telemetry::profile_message!(
+                "Slow app render: {render_ms:.1} ms on {:?}",
+                self.page
+            );
         }
 
         let root = v_flex()

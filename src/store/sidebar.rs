@@ -186,12 +186,16 @@ impl AgentsStore {
     /// which agents have settled. Cheap, so a frame can check it.
     fn sidebar_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
+        crate::telemetry::profile_zone!("QueryMT: Fingerprint session catalog");
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.prefs.show_pinned_sidebar.hash(&mut h);
         for c in &self.configs {
             (c.id.as_str(), self.catalog_settled(&c.id)).hash(&mut h);
         }
-        for s in self.all_sessions() {
+        let sessions = self.all_sessions();
+        // Every app build hashes the whole catalog: its size sets the cost.
+        crate::telemetry::profile_plot!("QueryMT: catalog sessions shown", sessions.len());
+        for s in sessions {
             (s.agent_id.as_str(), s.id.as_str()).hash(&mut h);
             (s.root, s.open, s.pinned, s.archived).hash(&mut h);
         }
@@ -201,6 +205,7 @@ impl AgentsStore {
     /// Update the saved orders with sessions that came and went. Saves when
     /// an order changed; does nothing when no session came or went.
     pub fn sync_sidebar_order(&mut self) {
+        crate::telemetry::profile_zone!("QueryMT: Sync sidebar order");
         let fingerprint = self.sidebar_fingerprint();
         if self.sidebar.fingerprint == Some(fingerprint) {
             return;

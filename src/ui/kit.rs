@@ -1375,6 +1375,7 @@ impl SecondClock {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
+                crate::telemetry::profiler::count(crate::telemetry::profiler::Count::SecondTick);
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
@@ -1466,6 +1467,8 @@ impl SpinnerClock {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(33))
                     .await;
+                // Each tick re-renders the view that drew the spinner.
+                crate::telemetry::profiler::count(crate::telemetry::profiler::Count::SpinnerTick);
                 if this
                     .update(cx, |clock, cx| {
                         clock.phase = spinner_phase(cx.background_executor().now() - started);

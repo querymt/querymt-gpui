@@ -45,21 +45,34 @@ pub fn language_for_path(path: &str) -> Option<String> {
 
 /// Byte-range styles for `code`, cached; empty when the language is unknown.
 fn spans(lang: &str, code: &str, theme: &Arc<HighlightTheme>) -> Spans {
+    // Hashing the whole text happens on every lookup, hit or miss.
+    crate::telemetry::profile_zone!(
+        "QueryMT: Look up highlight cache",
+        "{lang}, {} bytes",
+        code.len()
+    );
     let mut h = DefaultHasher::new();
     lang.hash(&mut h);
     code.hash(&mut h);
     (Arc::as_ptr(theme) as usize).hash(&mut h);
     let key = h.finish();
     if let Some(hit) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        crate::telemetry::profiler::count(crate::telemetry::profiler::Count::HighlightHit);
         return hit;
     }
+    crate::telemetry::profiler::count(crate::telemetry::profiler::Count::HighlightMiss);
     let styles: Spans = Rc::new(highlight_code(lang, code, theme.as_ref()));
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() >= CACHE_LIMIT {
+            crate::telemetry::profile_message!(
+                "Highlight cache full ({} entries): cleared",
+                c.len()
+            );
             c.clear();
         }
         c.insert(key, styles.clone());
+        crate::telemetry::profile_plot!("QueryMT: highlight cache entries", c.len());
     });
     styles
 }
