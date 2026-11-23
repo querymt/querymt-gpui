@@ -203,6 +203,44 @@ fn shared<'a>(grant: &'a PeerGrant, provider: &str) -> Option<&'a ModelSelection
 /// provider's limit lines, so every usage bar starts at the same x.
 const SCOPE_W: f32 = 200.;
 
+/// One chip per thing the saved grant lets the peer use here; the shell (and
+/// Full access, which includes it) in the warning tone.
+fn access_chips(grant: &PeerGrant, p: &Palette) -> Vec<Div> {
+    match grant {
+        PeerGrant::None => Vec::new(),
+        PeerGrant::Full => vec![kit::icon_tone_chip(
+            IconName::SquareTerminal,
+            "Full access",
+            p.warn,
+        )],
+        PeerGrant::Custom {
+            sessions,
+            filesystem,
+            shell,
+            providers,
+        } => {
+            let mut chips = Vec::new();
+            if !providers.is_empty() {
+                chips.push(kit::icon_chip(IconName::Boxes, "Models", p));
+            }
+            if *sessions {
+                chips.push(kit::icon_chip(IconName::MessagesSquare, "Sessions", p));
+            }
+            if *filesystem {
+                chips.push(kit::icon_chip(IconName::Folder, "Files", p));
+            }
+            if *shell {
+                chips.push(kit::icon_tone_chip(
+                    IconName::SquareTerminal,
+                    "Shell",
+                    p.warn,
+                ));
+            }
+            chips
+        }
+    }
+}
+
 fn subtle_text(p: &Palette) -> Div {
     div().text_xs().text_color(p.muted)
 }
@@ -532,6 +570,7 @@ impl QmtApp {
                     .child(
                         h_flex()
                             .gap_2()
+                            .flex_wrap()
                             .child(div().text_sm().font_semibold().child(peer.name.clone()))
                             .child(if !peer.online {
                                 kit::icon_chip(IconName::WifiOff, "Offline", p)
@@ -543,20 +582,10 @@ impl QmtApp {
                             } else {
                                 kit::chip("idle", p)
                             })
-                            .when(
-                                access.is_some_and(|a| {
-                                    matches!(
-                                        a.outgoing.grant,
-                                        PeerGrant::Full | PeerGrant::Custom { shell: true, .. }
-                                    )
-                                }),
-                                |el| {
-                                    el.child(kit::icon_tone_chip(
-                                        IconName::SquareTerminal,
-                                        "Shell access",
-                                        p.warn,
-                                    ))
-                                },
+                            .children(
+                                access
+                                    .map(|a| access_chips(&a.outgoing.grant, p))
+                                    .unwrap_or_default(),
                             )
                             .when(peer.sharing.limit_reached(), |el| {
                                 el.child(kit::icon_tone_chip(
