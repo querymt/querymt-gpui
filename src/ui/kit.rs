@@ -368,21 +368,6 @@ pub fn flat_menu_btn(
         )
 }
 
-/// A pill of a multi-select row: the soft accent tint while on, the flat
-/// fill while off. Compact, like [`flat_btn`].
-pub fn toggle_chip(
-    id: impl Into<ElementId>,
-    on: bool,
-    enabled: bool,
-    p: &Palette,
-) -> Stateful<Div> {
-    if on {
-        soft_accent_btn(id, enabled, p).text_color(p.text)
-    } else {
-        flat_btn(id, enabled, true, p).text_color(p.muted)
-    }
-}
-
 /// Border of a focused dialog field (desktop `--subtle-border-strong`):
 /// faint, never a coloured ring.
 pub fn field_focus_border(p: &Palette) -> Hsla {

@@ -806,7 +806,7 @@ impl QmtApp {
             )
             .child(subtle_text(p).flex_1().min_w_0().child(match mode {
                 "none" => format!("{name} can see this machine in the mesh, nothing more."),
-                "custom" => "Only what you turn on below.".to_string(),
+                "custom" => "Only the tools and models you choose below.".to_string(),
                 _ => String::new(),
             }));
 
@@ -1019,77 +1019,79 @@ impl QmtApp {
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> Div {
-        let pill = |this: &Self,
-                    name: &'static str,
-                    icon: IconName,
-                    title: &'static str,
-                    on: bool,
-                    cx: &mut Context<Self>,
-                    set: fn(&mut GrantDraft, bool)| {
-            let id = peer.id.clone();
-            let _ = this;
-            kit::toggle_chip(kit::keyed(name, peer.id.clone()), on, !saving, p)
-                .child(kit::icon(icon, 13., if on { p.accent } else { p.muted }))
-                .child(title)
-                .when(on, |el| el.child(kit::icon(IconName::Check, 12., p.accent)))
-                .when(!saving, |el| {
-                    el.on_click(cx.listener(move |this, _, _, cx| {
-                        this.edit_draft(&id, cx, |d| set(d, !on));
-                    }))
-                })
+        // Sessions, Files and Shell are a ladder (each needs the one before),
+        // so they are one choice of level rather than three toggles.
+        let level: u8 = match (sessions, filesystem, shell) {
+            (true, true, true) => 3,
+            (true, true, false) => 2,
+            (true, false, _) => 1,
+            _ => 0,
         };
-        let summary = match (sessions, filesystem, shell) {
-            (false, _, _) => {
-                "Nothing yet: the peer can only use models you share below.".to_string()
-            }
-            (true, false, _) => format!(
+        let segment = |lvl: u8, name: &'static str, icon: IconName, label: &'static str| {
+            let id = peer.id.clone();
+            kit::segment(kit::keyed(name, peer.id.clone()), level == lvl, p)
+                .icon(icon)
+                .label(label)
+                .inactive(saving)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.edit_draft(&id, cx, |d| d.set_tool_level(lvl));
+                }))
+        };
+        let summary = match level {
+            0 => format!("{} can only use the models you share below.", peer.name),
+            1 => format!(
                 "{} can list, open, start and prompt sessions here.",
                 peer.name
             ),
-            (true, true, false) => format!(
+            2 => format!(
                 "{} can run sessions and change files inside their workspace.",
                 peer.name
             ),
-            (true, true, true) => format!(
+            _ => format!(
                 "{} can run sessions, change workspace files, and use the unsandboxed shell.",
                 peer.name
             ),
         };
         v_flex()
-            .gap_1p5()
+            .gap_2()
             .child(
-                h_flex()
-                    .gap_1p5()
-                    .flex_wrap()
-                    .child(pill(
-                        self,
-                        "share-sessions",
-                        IconName::MessagesSquare,
-                        "Sessions",
-                        sessions,
-                        cx,
-                        GrantDraft::set_sessions,
-                    ))
-                    .child(pill(
-                        self,
-                        "share-files",
-                        IconName::Folder,
-                        "Files",
-                        filesystem,
-                        cx,
-                        GrantDraft::set_filesystem,
-                    ))
-                    .child(pill(
-                        self,
-                        "share-shell",
-                        IconName::SquareTerminal,
-                        "Shell",
-                        shell,
-                        cx,
-                        GrantDraft::set_shell,
-                    )),
+                v_flex()
+                    .child(div().text_sm().font_medium().child("Tools"))
+                    .child(subtle_text(p).child(format!(
+                        "What {} may do here besides using models. Each level includes the ones before it.",
+                        peer.name
+                    ))),
             )
-            .child(subtle_text(p).whitespace_normal().child(summary))
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        h_flex().child(
+                            kit::segment_bar(p)
+                                .child(segment(
+                                    0,
+                                    "share-models-only",
+                                    IconName::Boxes,
+                                    "Models only",
+                                ))
+                                .child(segment(
+                                    1,
+                                    "share-sessions",
+                                    IconName::MessagesSquare,
+                                    "Sessions",
+                                ))
+                                .child(segment(2, "share-files", IconName::Folder, "+ Files"))
+                                .child(segment(
+                                    3,
+                                    "share-shell",
+                                    IconName::SquareTerminal,
+                                    "+ Shell",
+                                )),
+                        ),
+                    )
+                    // What the chosen level allows, as the selector's subtitle.
+                    .child(subtle_text(p).whitespace_normal().child(summary)),
+            )
     }
 
     /// "Add provider": a menu of the catalog providers not shared yet.

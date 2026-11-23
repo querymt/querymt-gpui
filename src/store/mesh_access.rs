@@ -1120,6 +1120,23 @@ impl GrantDraft {
         }
     }
 
+    /// Set the tools as one level of the ladder: 0 models only, 1 sessions,
+    /// 2 sessions and files, 3 (or more) sessions, files and the shell.
+    pub fn set_tool_level(&mut self, level: u8) {
+        match level {
+            0 => self.set_sessions(false),
+            1 => {
+                self.set_sessions(true);
+                self.set_filesystem(false);
+            }
+            2 => {
+                self.set_filesystem(true);
+                self.set_shell(false);
+            }
+            _ => self.set_shell(true),
+        }
+    }
+
     /// Share a provider (all models) or stop sharing it; `order` keeps the
     /// catalog order.
     pub fn set_provider(&mut self, provider_id: &str, on: bool, order: &[String]) {
@@ -1891,6 +1908,19 @@ mod tests {
             (true, false, false),
             "files off turns shell off"
         );
+        // One level of the ladder, from any starting point.
+        for (level, want) in [
+            (3, (true, true, true)),
+            (1, (true, false, false)),
+            (2, (true, true, false)),
+            (0, (false, false, false)),
+            (2, (true, true, false)),
+            (3, (true, true, true)),
+            (2, (true, true, false)),
+        ] {
+            draft.set_tool_level(level);
+            assert_eq!(switches(&draft), want, "level {level}");
+        }
         draft.set_sessions(false);
         let order = vec!["anthropic".to_string(), "codex".to_string()];
         draft.set_provider("codex", true, &order);
