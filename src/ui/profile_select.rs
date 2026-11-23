@@ -55,26 +55,15 @@ impl OptionMenu {
         }
     }
 
-    /// Mono tag at the end of a row: a profile's id, or the tail of a host's
-    /// peer id (enough to tell hosts with the same name apart). The search
-    /// still matches the whole id.
+    /// Mono tag at the end of a row: a profile's id, or a host's short peer
+    /// id (enough to tell hosts with the same name apart). The search still
+    /// matches the whole id.
     fn tag(self, id: &str) -> Option<String> {
         match self {
             Self::Profile => Some(id.to_owned()),
             Self::Target if id == LOCAL_TARGET => None,
-            Self::Target => Some(peer_tag(id)),
+            Self::Target => Some(crate::util::short_peer(id)),
         }
-    }
-}
-
-/// The last characters of a peer id: its leading characters are often a
-/// shared multihash prefix, the tail is what differs.
-fn peer_tag(id: &str) -> String {
-    let chars: Vec<char> = id.chars().collect();
-    if chars.len() <= 10 {
-        id.to_owned()
-    } else {
-        format!("…{}", chars[chars.len() - 8..].iter().collect::<String>())
     }
 }
 
@@ -595,12 +584,17 @@ impl QmtApp {
 #[cfg(test)]
 mod tests {
     // Not a glob: `gpui_kit::*` would shadow the `#[test]` attribute.
-    use super::{OptionMenu, ProfileItem, peer_tag, profile_items, search};
+    use super::{OptionMenu, ProfileItem, profile_items, search};
 
     #[test]
-    fn host_rows_end_with_the_peer_id_tail() {
-        assert_eq!(peer_tag("12D3KooWAbCdEfGh12345678"), "…12345678");
-        assert_eq!(peer_tag("short"), "short");
+    fn host_rows_end_with_the_short_peer_id() {
+        assert_eq!(
+            OptionMenu::Target
+                .tag("12D3KooWAbCdEfGh12345678")
+                .as_deref(),
+            Some("12D3KooWAbCd…12345678")
+        );
+        assert_eq!(OptionMenu::Target.tag("short").as_deref(), Some("short"));
         assert_eq!(OptionMenu::Target.tag("local"), None);
         assert_eq!(OptionMenu::Profile.tag("dev").as_deref(), Some("dev"));
     }

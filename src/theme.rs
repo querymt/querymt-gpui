@@ -204,6 +204,10 @@ pub fn apply(dark: bool, accent: &str, cx: &mut App) {
         t.sidebar_primary = p.accent;
         t.sidebar_primary_foreground = p.on_accent;
 
+        // The stock off-switch track (#404040) barely shows on a dark card.
+        t.switch = if p.dark { hex(0x5c5c5c) } else { hex(0xc8c6c3) };
+        t.switch_thumb = if p.dark { hex(0xf5f5f5) } else { hex(0xffffff) };
+
         t.title_bar = p.bg;
         t.title_bar_border = p.bg;
         t.window_border = p.border;

@@ -330,6 +330,44 @@ pub fn soft_accent_btn(id: impl Into<ElementId>, enabled: bool, p: &Palette) -> 
     )
 }
 
+/// A component `Button` that looks exactly like a compact [`flat_btn`] with a
+/// trailing chevron, for the places that need a `Button` (dropdown menus).
+/// The content is drawn here rather than with the component's label and
+/// caret, which size themselves and so would not match a `flat_btn` beside it.
+pub fn flat_menu_btn(
+    id: impl Into<ElementId>,
+    icon_name: Option<IconName>,
+    label: impl Into<SharedString>,
+    p: &Palette,
+    cx: &App,
+) -> Button {
+    let (fill, hover) = flat_fill(p);
+    let label = label.into();
+    button(id)
+        .custom(
+            gpui_kit::component::button::ButtonCustomVariant::new(cx)
+                .color(fill)
+                .foreground(p.text)
+                .hover(hover)
+                .active(hover),
+        )
+        .small()
+        .h(px(32.))
+        .px(px(12.))
+        .rounded(px(8.))
+        .accessibility_label(label.clone())
+        .child(
+            h_flex()
+                .gap(px(6.4))
+                .text_size(px(12.))
+                .font_weight(FontWeight(550.))
+                .text_color(p.text)
+                .when_some(icon_name, |el, name| el.child(icon(name, 12., p.text)))
+                .child(label)
+                .child(icon(IconName::ChevronDown, 12., p.dim)),
+        )
+}
+
 /// Border of a focused dialog field (desktop `--subtle-border-strong`):
 /// faint, never a coloured ring.
 pub fn field_focus_border(p: &Palette) -> Hsla {
@@ -360,7 +398,7 @@ pub fn field_shell(focused: bool, p: &Palette) -> Div {
 /// Rest and hover fills of [`flat_btn`].
 pub fn flat_fill(p: &Palette) -> (Hsla, Hsla) {
     if p.dark {
-        (hsla(0., 0., 1., 0.045), hsla(0., 0., 1., 0.09))
+        (hsla(0., 0., 1., 0.07), hsla(0., 0., 1., 0.12))
     } else {
         (p.muted.opacity(0.07), p.muted.opacity(0.13))
     }

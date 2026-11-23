@@ -14,13 +14,7 @@ use crate::util::now_ms;
 pub const INVITE_TTLS: [(&str, &str); 3] =
     [("1h", "1 hour"), ("24h", "24 hours"), ("168h", "7 days")];
 
-/// `12D3KooWPtRj...unWZUT62`
-pub fn short_peer(id: &str) -> String {
-    if id.len() <= 24 {
-        return id.to_string();
-    }
-    format!("{}...{}", &id[..12], &id[id.len() - 8..])
-}
+pub use crate::util::short_peer;
 
 fn epoch_ms(t: f64) -> f64 {
     if t > 1e12 { t } else { t * 1000. }
@@ -51,7 +45,11 @@ pub fn panel(p: &Palette) -> Div {
 }
 
 impl QmtApp {
-    pub(super) fn render_mesh(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_mesh(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = *palette(cx);
         let store = self.store.read(cx);
         let agent = store.primary_agent();
@@ -88,6 +86,9 @@ impl QmtApp {
 
         let show_remote = store.prefs.show_remote_sessions;
         let remote_peers = store.prefs.remote_session_peers.clone();
+        let sharing = agent
+            .as_deref()
+            .is_some_and(|a| store.mesh_access_supported(a));
         let header = kit::page_header(
             "Mesh",
             agent_name
@@ -310,12 +311,16 @@ impl QmtApp {
                 ),
         );
 
-        let nodes_list = if nodes.is_empty() {
+        let nodes_list = if sharing {
+            self.render_sharing_nodes(&agent, window, cx)
+                .into_any_element()
+        } else if nodes.is_empty() {
             kit::card(&p)
                 .p_4()
                 .text_sm()
                 .text_color(p.muted)
                 .child("No remote nodes yet. Invite a peer to join this mesh.")
+                .into_any_element()
         } else {
             kit::card(&p)
                 .children(nodes.into_iter().enumerate().map(|(ix, n)| {
@@ -398,7 +403,21 @@ impl QmtApp {
                         .child(include)
                 }))
                 .child(kit::card_mask(&p))
+                .into_any_element()
         };
+        // An agent without mesh access v1: say why there is nothing to set.
+        let no_sharing = (!sharing).then(|| {
+            h_flex()
+                .gap_1p5()
+                .px_1()
+                .text_xs()
+                .text_color(p.muted)
+                .child(kit::icon(IconName::Info, 13., p.muted))
+                .child(
+                    "This agent can't choose what each peer may use. Per-peer sharing and usage \
+                     limits need a QueryMT version with mesh access.",
+                )
+        });
 
         // ---- invites
         // The new link: copy it (with feedback), or expand it into a QR code
@@ -644,11 +663,16 @@ impl QmtApp {
                 .gap_3()
                 .child(kit::section_header(
                     "Nodes",
-                    "Remote peers available through the selected agent.",
+                    if sharing {
+                        "Peers in this mesh and what you share with each other. Open one to choose what it may use here."
+                    } else {
+                        "Remote peers available through the selected agent."
+                    },
                     None,
                     &p,
                 ))
                 .child(nodes_list)
+                .children(no_sharing)
                 .into_any_element(),
             v_flex()
                 .gap_3()

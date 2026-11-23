@@ -213,11 +213,7 @@ impl AgentsStore {
         if can_create {
             out.extend(rt.mesh_nodes.iter().map(|node| TargetChoice {
                 node_id: Some(node.id.clone()),
-                label: if node.label.is_empty() {
-                    node.id.clone()
-                } else {
-                    node.label.clone()
-                },
+                label: rt.peer_name(&node.id),
                 detail: peer_detail(&node.transport, node.active_sessions),
                 unavailable: false,
             }));
@@ -230,7 +226,7 @@ impl AgentsStore {
                 .iter()
                 .filter_map(|s| s.remote.as_ref())
                 .find(|r| &r.node_id == target)
-                .map_or_else(|| target.clone(), |r| r.name());
+                .map_or_else(|| rt.peer_name(target), |r| r.name());
             out.push(TargetChoice {
                 node_id: Some(target.clone()),
                 label,
