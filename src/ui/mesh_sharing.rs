@@ -508,26 +508,26 @@ impl QmtApp {
         let (_, hover) = kit::subtle(p);
         let access = peer.sharing.access.as_ref();
         let unsaved = self.sharing.drafts.contains_key(&peer.id);
-        let direction = |icon: IconName, label: &'static str, value: String| {
+        // Same wording and arrows as the two blocks of the open panel.
+        let direction = |outgoing: bool, value: String| {
             h_flex()
                 .gap_1()
                 .min_w_0()
-                .child(kit::icon(icon, 12., p.dim))
-                .child(div().text_color(p.dim).child(label))
+                .child(kit::icon(direction_icon(outgoing), 12., p.dim))
+                .child(
+                    div()
+                        .text_color(p.dim)
+                        .child(format!("{}:", direction_label(outgoing, &peer.name))),
+                )
                 .child(div().truncate().text_color(p.muted).child(value))
         };
         let summary = match access {
             Some(a) => h_flex()
                 .gap_3()
                 .min_w_0()
+                .child(direction(true, access::grant_summary(&a.outgoing.grant)))
                 .child(direction(
-                    IconName::ArrowUpRight,
-                    "You share",
-                    access::grant_summary(&a.outgoing.grant),
-                ))
-                .child(direction(
-                    IconName::ArrowDownLeft,
-                    "They share",
+                    false,
                     access::incoming_summary(a.incoming.as_ref()),
                 )),
             None if peer.sharing.error.is_some() => h_flex()
@@ -582,17 +582,38 @@ impl QmtApp {
                             } else {
                                 kit::chip("idle", p)
                             })
-                            .children(
-                                access
+                            // What the peer may use here (You → peer), led by
+                            // the same arrow as that direction.
+                            .children({
+                                let chips = access
                                     .map(|a| access_chips(&a.outgoing.grant, p))
-                                    .unwrap_or_default(),
-                            )
-                            .when(peer.sharing.limit_reached(), |el| {
-                                el.child(kit::icon_tone_chip(
-                                    IconName::Gauge,
-                                    "Limit reached",
-                                    p.warn,
-                                ))
+                                    .unwrap_or_default();
+                                let limit = peer.sharing.limit_reached();
+                                (!chips.is_empty() || limit).then(|| {
+                                    let name = &peer.name;
+                                    let mut tip = format!(
+                                        "{}: what {name} may use on this machine.",
+                                        direction_label(true, name)
+                                    );
+                                    if limit {
+                                        tip.push_str(&format!(" {name} used up a limit you set."));
+                                    }
+                                    h_flex()
+                                        .id(kit::keyed("peer-access-chips", peer.id.clone()))
+                                        .gap_1()
+                                        .child(kit::icon(direction_icon(true), 12., p.dim))
+                                        .children(chips)
+                                        .when(limit, |el| {
+                                            el.child(kit::icon_tone_chip(
+                                                IconName::Gauge,
+                                                "Limit reached",
+                                                p.warn,
+                                            ))
+                                        })
+                                        .tooltip(move |window, cx| {
+                                            kit::wrap_tip(tip.clone()).build(window, cx)
+                                        })
+                                })
                             })
                             .when(unsaved, |el| el.child(kit::chip("Unsaved changes", p))),
                     )
@@ -715,10 +736,15 @@ impl QmtApp {
                     .child("Checking what you share…"),
             });
         };
+        // Two separate blocks, one per direction, so a banner or a usage
+        // counter can only be read as part of its own direction.
         panel
-            .child(self.outgoing_editor(agent, peer, &access, hostname, p, window, cx))
-            .child(kit::divider(p).bg(divider))
-            .child(incoming_view(peer, &access, p))
+            .gap_3()
+            .child(
+                direction_block(p)
+                    .child(self.outgoing_editor(agent, peer, &access, hostname, p, window, cx)),
+            )
+            .child(direction_block(p).child(incoming_view(peer, &access, p)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -742,7 +768,7 @@ impl QmtApp {
         let stopping = self.sharing.busy.contains(&stop_key);
         let name = peer.name.clone();
 
-        // ---- header: what this is, and the quick way out
+        // ---- header: which direction this is, and the quick way out
         let header = h_flex()
             .gap_3()
             .child(
@@ -750,17 +776,15 @@ impl QmtApp {
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(format!("What {name} may use on {hostname}")),
-                    )
-                    .child(subtle_text(p).child(if peer.online {
-                        "Saved on this machine by peer ID; changes apply to new requests."
-                    } else {
-                        "Offline now. The saved setting stays and applies when it reconnects."
-                    })),
+                    .child(direction_title(true, &name, p))
+                    .child(subtle_text(p).child(format!(
+                        "What {name} may use on {hostname}. {}",
+                        if peer.online {
+                            "Saved here by peer ID; changes apply to new requests."
+                        } else {
+                            "Offline now; the saved setting applies when it reconnects."
+                        }
+                    ))),
             )
             .when(saved.grant != PeerGrant::None, |el| {
                 let (a, id) = (agent.to_string(), peer.id.clone());
@@ -841,7 +865,7 @@ impl QmtApp {
 
         let body = match &grant {
             PeerGrant::None => None,
-            PeerGrant::Full => Some(full_warning(p)),
+            PeerGrant::Full => Some(full_warning(&name, hostname, p)),
             PeerGrant::Custom {
                 sessions,
                 filesystem,
@@ -2258,13 +2282,68 @@ impl QmtApp {
     }
 }
 
+/// Arrow of a direction: up-right for what goes out to the peer, down-left
+/// for what comes in from it.
+fn direction_icon(outgoing: bool) -> IconName {
+    if outgoing {
+        IconName::ArrowUpRight
+    } else {
+        IconName::ArrowDownLeft
+    }
+}
+
+/// "You → peer" or "peer → you", the same in the row and the open panel.
+fn direction_label(outgoing: bool, name: &str) -> String {
+    if outgoing {
+        format!("You → {name}")
+    } else {
+        format!("{name} → you")
+    }
+}
+
+/// Heading of one direction block: its arrow in a small tile, then the label.
+fn direction_title(outgoing: bool, name: &str, p: &Palette) -> Div {
+    h_flex()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .size(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .bg(p.chip)
+                .child(kit::icon(direction_icon(outgoing), 13., p.text)),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_semibold()
+                .child(direction_label(outgoing, name)),
+        )
+}
+
+/// Bordered block holding one direction of a peer's sharing.
+fn direction_block(p: &Palette) -> Div {
+    let (_, surface) = kit::subtle(p);
+    v_flex()
+        .p_3()
+        .rounded(px(12.))
+        .border_1()
+        .border_color(p.border)
+        .bg(surface)
+}
+
 /// The peer's side: what it lets this machine use. Read-only.
 fn incoming_view(peer: &PeerView, access: &PeerAccess, p: &Palette) -> Div {
     let name = peer.name.clone();
-    let title = div()
-        .text_sm()
-        .font_semibold()
-        .child(format!("What {name} shares with you"));
+    let title = v_flex()
+        .gap_0p5()
+        .child(direction_title(false, &name, p))
+        .child(subtle_text(p).child(format!(
+            "What {name} lets you use on it. Set on {name}; read-only here."
+        )));
     let body = match &access.incoming {
         Some(Incoming::Granted { effective, quotas }) => {
             let mut can: Vec<&str> = Vec::new();
@@ -2278,7 +2357,7 @@ fn incoming_view(peer: &PeerView, access: &PeerAccess, p: &Palette) -> Div {
                 can.push("Shell");
             }
             let lead = match effective.mode {
-                access::AccessMode::Full => "Full access.".to_string(),
+                access::AccessMode::Full => format!("Full access to {name}."),
                 access::AccessMode::Custom if can.is_empty() && effective.providers.is_empty() => {
                     "Nothing yet.".to_string()
                 }
@@ -2349,8 +2428,9 @@ fn incoming_view(peer: &PeerView, access: &PeerAccess, p: &Palette) -> Div {
     v_flex().gap_2().child(title).child(body)
 }
 
-/// Full, said plainly.
-fn full_warning(p: &Palette) -> AnyElement {
+/// Full, said plainly, naming who may use what so it cannot be read as
+/// being about the other direction.
+fn full_warning(name: &str, hostname: &str, p: &Palette) -> AnyElement {
     h_flex()
         .gap_1p5()
         .px_3()
@@ -2361,7 +2441,10 @@ fn full_warning(p: &Palette) -> AnyElement {
         .border_color(p.warn.opacity(0.3))
         .text_sm()
         .child(kit::icon(IconName::ShieldAlert, 15., p.warn))
-        .child("Full: everything, including the unsandboxed shell, no limits.")
+        .child(format!(
+            "Full: {name} may use everything on {hostname}, including the unsandboxed shell, \
+             with no limits."
+        ))
         .into_any_element()
 }
 
