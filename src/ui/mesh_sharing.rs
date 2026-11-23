@@ -2155,8 +2155,10 @@ impl QmtApp {
             })
     }
 
-    /// Saved limits the current grant does not apply (switched to No
-    /// access or Full, or the provider/model is not shared).
+    /// Saved limits a Custom grant does not apply (the provider or model is
+    /// not shared). Hidden under No access and Full access, where limits do
+    /// not apply at all and the list would only be noise; they come back
+    /// with Custom.
     #[allow(clippy::too_many_arguments)]
     fn idle_limits(
         &mut self,
@@ -2168,14 +2170,16 @@ impl QmtApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let shown = |q: &PeerQuota| match (grant, &q.scope.model_id) {
-            (PeerGrant::Custom { .. }, None) => shared(grant, &q.scope.provider_id).is_some(),
-            (PeerGrant::Custom { .. }, Some(model)) => match shared(grant, &q.scope.provider_id) {
+        if !matches!(grant, PeerGrant::Custom { .. }) {
+            return None;
+        }
+        let shown = |q: &PeerQuota| match &q.scope.model_id {
+            None => shared(grant, &q.scope.provider_id).is_some(),
+            Some(model) => match shared(grant, &q.scope.provider_id) {
                 Some(ModelSelection::All) => true,
                 Some(ModelSelection::Selected { model_ids }) => model_ids.contains(model),
                 None => false,
             },
-            _ => false,
         };
         let idle: Vec<PeerQuota> = access
             .outgoing
@@ -2187,15 +2191,11 @@ impl QmtApp {
         if idle.is_empty() {
             return None;
         }
-        let why = match grant {
-            PeerGrant::Full => "Full access does not use limits; they apply again with Custom.",
-            PeerGrant::None => "They apply again when you share these with Custom access.",
-            PeerGrant::Custom { .. } => "They apply once you share these providers or models.",
-        };
+        let why = "They apply once you share these providers or models.";
         let mut rows = Vec::new();
         for q in idle {
             let label = div()
-                .w(px(190.))
+                .w(px(SCOPE_W))
                 .flex_none()
                 .truncate()
                 .text_xs()
