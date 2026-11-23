@@ -30,15 +30,16 @@ use gpui_kit::*;
 
 /// Report every heap allocation to Tracy (its Memory window and memory
 /// plot). On-demand mode drops events while no profiler is connected, so
-/// the Memory window covers what happened since connecting.
-#[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+/// the Memory window covers what happened since connecting. Its own feature:
+/// the viewer keeps every event, gigabytes over a long session.
+#[cfg(all(feature = "tracy-memory", not(target_family = "wasm")))]
 #[global_allocator]
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, ALLOC_CALLSTACK_DEPTH);
 
 /// Frames recorded per allocation: callstacks show where memory comes from
 /// but slow every allocation down, so they are a separate feature.
-#[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+#[cfg(all(feature = "tracy-memory", not(target_family = "wasm")))]
 const ALLOC_CALLSTACK_DEPTH: u16 = if cfg!(feature = "tracy-memory-callstacks") {
     24
 } else {

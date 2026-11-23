@@ -64,6 +64,39 @@ macro_rules! profile_message {
 }
 pub(crate) use profile_message;
 
+/// Wrap an element so Tracy times its subtree's GPUI phases after `render`:
+/// zones `<name> (layout)`, `<name> (prepaint)` and `<name> (paint)`, with
+/// optional text (`format!` arguments). Yields an `AnyElement`; without the
+/// `tracy` feature it is just the element.
+macro_rules! profile_element {
+    ($name:literal, $element:expr $(,)?) => {
+        $crate::telemetry::profile_element!(@wrap $name, $element, None::<String>)
+    };
+    ($name:literal, $element:expr, $($text:tt)+) => {
+        $crate::telemetry::profile_element!(
+            @wrap $name,
+            $element,
+            $crate::telemetry::profiler::connected().then(|| format!($($text)+))
+        )
+    };
+    (@wrap $name:literal, $element:expr, $text:expr) => {{
+        #[cfg(all(feature = "tracy", not(target_family = "wasm")))]
+        let element = $crate::telemetry::profiler::Profiled::wrap(
+            [
+                tracy_client::span_location!(concat!($name, " (layout)")),
+                tracy_client::span_location!(concat!($name, " (prepaint)")),
+                tracy_client::span_location!(concat!($name, " (paint)")),
+            ],
+            $text,
+            gpui_kit::IntoElement::into_any_element($element),
+        );
+        #[cfg(not(all(feature = "tracy", not(target_family = "wasm"))))]
+        let element = gpui_kit::IntoElement::into_any_element($element);
+        element
+    }};
+}
+pub(crate) use profile_element;
+
 /// Tracy helpers behind the macros above, plus event counters plotted once
 /// per app build. Without the `tracy` feature every function is a no-op.
 pub mod profiler {
@@ -200,6 +233,90 @@ pub mod profiler {
                 ),
             ] {
                 client.plot(name, take(what));
+            }
+        }
+
+        /// A pass-through element timing its child's GPUI phases (see
+        /// `profile_element!`). Layout engine work runs when the window first
+        /// asks for bounds, so it lands outside these zones.
+        pub struct Profiled {
+            zones: [&'static tracy_client::SpanLocation; 3],
+            text: Option<String>,
+            child: gpui_kit::AnyElement,
+        }
+
+        impl Profiled {
+            pub fn wrap(
+                zones: [&'static tracy_client::SpanLocation; 3],
+                text: Option<String>,
+                child: gpui_kit::AnyElement,
+            ) -> gpui_kit::AnyElement {
+                gpui_kit::IntoElement::into_any_element(Self { zones, text, child })
+            }
+
+            fn zone(&self, phase: usize) -> Option<tracy_client::Span> {
+                let zone = tracy_client::Client::running()?.span(self.zones[phase], 0);
+                if let Some(text) = &self.text {
+                    zone.emit_text(text);
+                }
+                Some(zone)
+            }
+        }
+
+        impl gpui_kit::IntoElement for Profiled {
+            type Element = Self;
+            fn into_element(self) -> Self {
+                self
+            }
+        }
+
+        impl gpui_kit::Element for Profiled {
+            type RequestLayoutState = ();
+            type PrepaintState = ();
+
+            fn id(&self) -> Option<gpui_kit::ElementId> {
+                None
+            }
+            fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+                None
+            }
+
+            fn request_layout(
+                &mut self,
+                _: Option<&gpui_kit::GlobalElementId>,
+                _: Option<&gpui_kit::InspectorElementId>,
+                window: &mut gpui_kit::Window,
+                cx: &mut gpui_kit::App,
+            ) -> (gpui_kit::LayoutId, ()) {
+                let _zone = self.zone(0);
+                (self.child.request_layout(window, cx), ())
+            }
+
+            fn prepaint(
+                &mut self,
+                _: Option<&gpui_kit::GlobalElementId>,
+                _: Option<&gpui_kit::InspectorElementId>,
+                _: gpui_kit::Bounds<gpui_kit::Pixels>,
+                _: &mut (),
+                window: &mut gpui_kit::Window,
+                cx: &mut gpui_kit::App,
+            ) {
+                let _zone = self.zone(1);
+                self.child.prepaint(window, cx);
+            }
+
+            fn paint(
+                &mut self,
+                _: Option<&gpui_kit::GlobalElementId>,
+                _: Option<&gpui_kit::InspectorElementId>,
+                _: gpui_kit::Bounds<gpui_kit::Pixels>,
+                _: &mut (),
+                _: &mut (),
+                window: &mut gpui_kit::Window,
+                cx: &mut gpui_kit::App,
+            ) {
+                let _zone = self.zone(2);
+                self.child.paint(window, cx);
             }
         }
     }

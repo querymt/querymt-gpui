@@ -1315,7 +1315,10 @@ impl Render for QmtApp {
                     this.last_escape = Some(now);
                 }
             }))
-            .child(header)
+            .child(crate::telemetry::profile_element!(
+                "QueryMT: Title bar",
+                header
+            ))
             .child(
                 h_flex()
                     .flex_1()
@@ -1324,25 +1327,38 @@ impl Render for QmtApp {
                     // Setup is left only by finishing or skipping it.
                     .when(!setup, |el| {
                         let sidebar = self.render_sidebar(window, cx);
-                        el.child(self.smooth_scroll.region("sidebar", sidebar))
+                        el.child(crate::telemetry::profile_element!(
+                            "QueryMT: Sidebar",
+                            self.smooth_scroll.region("sidebar", sidebar)
+                        ))
                     })
-                    .child(self.smooth_scroll.region(
-                        "page",
-                        // These pages scroll their own (virtualized) lists.
-                        if matches!(self.page, Page::Session | Page::Sessions) {
-                            div().id("page").flex_1().min_w_0().h_full().child(body)
-                        } else {
-                            div()
-                                .id("page")
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .overflow_y_scroll()
-                                .child(body)
-                        },
+                    .child(crate::telemetry::profile_element!(
+                        "QueryMT: Page",
+                        self.smooth_scroll.region(
+                            "page",
+                            // These pages scroll their own (virtualized) lists.
+                            if matches!(self.page, Page::Session | Page::Sessions) {
+                                div().id("page").flex_1().min_w_0().h_full().child(body)
+                            } else {
+                                div()
+                                    .id("page")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .child(body)
+                            },
+                        ),
+                        "{:?}",
+                        self.page
                     )),
             )
-            .children(overlay.map(|el| self.smooth_scroll.region("overlay", el)))
+            .children(overlay.map(|el| {
+                crate::telemetry::profile_element!(
+                    "QueryMT: Overlay",
+                    self.smooth_scroll.region("overlay", el)
+                )
+            }))
             .into_any_element()
     }
 }

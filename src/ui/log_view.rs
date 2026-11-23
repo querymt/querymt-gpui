@@ -812,7 +812,10 @@ impl QmtApp {
                 }
             });
             list(self.log_view.list.clone(), move |ix, window, cx| {
-                render(ix, window, cx)
+                crate::telemetry::profile_element!(
+                    "QueryMT: Debug event row",
+                    render(ix, window, cx)
+                )
             })
             .size_full()
             .py_1()

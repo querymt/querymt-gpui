@@ -5374,7 +5374,8 @@ impl QmtApp {
                                 .flex_1()
                                 .min_h_0()
                                 .w_full()
-                                .child(
+                                .child(crate::telemetry::profile_element!(
+                                    "QueryMT: Transcript list",
                                     self.smooth_scroll.region(
                                         "transcript",
                                         list(self.transcript.list.clone(), move |ix, _, _| {
@@ -5383,7 +5384,14 @@ impl QmtApp {
                                                 Some(row) => {
                                                     let started = timed.then(crate::util::now_ms);
                                                     rc2.md.begin_row(&row.key);
-                                                    let el = render_row(&row, &rc2);
+                                                    // Measured rows lay out here; the
+                                                    // list's prepaint holds that time.
+                                                    let el = crate::telemetry::profile_element!(
+                                                        "QueryMT: Transcript row",
+                                                        render_row(&row, &rc2),
+                                                        "{}",
+                                                        row.key
+                                                    );
                                                     rc2.md.end_row();
                                                     if let Some(started) = started {
                                                         row_probe
@@ -5402,7 +5410,7 @@ impl QmtApp {
                                         .pt(px(TRANSCRIPT_TOP_FADE_H))
                                         .pb(px(composer_h)),
                                     ),
-                                )
+                                ))
                                 // Telemetry: sample the list after its layout (siblings
                                 // prepaint in order). Absent unless export or Tracy is on.
                                 .when(crate::telemetry::probing(), |el| {
@@ -5814,8 +5822,14 @@ impl QmtApp {
                     .gap_2()
                     .children(mcp_notice)
                     .children(request_cards)
-                    .child(dock)
-                    .child(self.smooth_scroll.region("composer", composer)),
+                    .child(crate::telemetry::profile_element!(
+                        "QueryMT: Activity dock",
+                        dock
+                    ))
+                    .child(crate::telemetry::profile_element!(
+                        "QueryMT: Composer",
+                        self.smooth_scroll.region("composer", composer)
+                    )),
             );
 
         let chat = v_flex()

@@ -930,7 +930,10 @@ impl QmtApp {
             let render =
                 cx.processor(|this: &mut Self, ix: usize, _, cx| this.render_session_entry(ix, cx));
             list(self.session_list.state.clone(), move |ix, window, cx| {
-                render(ix, window, cx)
+                crate::telemetry::profile_element!(
+                    "QueryMT: Session catalog row",
+                    render(ix, window, cx)
+                )
             })
             .size_full()
             .pb_6()

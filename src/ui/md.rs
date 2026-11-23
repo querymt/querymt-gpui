@@ -384,6 +384,8 @@ impl Element for CodeHeader {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // Lays out its own row as a separate root.
+        crate::telemetry::profile_zone!("QueryMT: Code block header (prepaint)");
         let inset = window.rem_size() * 0.5;
         self.row.prepaint_as_root(
             bounds.origin - point(px(0.), inset),
@@ -406,6 +408,7 @@ impl Element for CodeHeader {
         window: &mut Window,
         cx: &mut App,
     ) {
+        crate::telemetry::profile_zone!("QueryMT: Code block header (paint)");
         self.row.paint(window, cx);
     }
 }

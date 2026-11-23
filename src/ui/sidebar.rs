@@ -435,7 +435,7 @@ impl QmtApp {
             this.render_side_item(rail, ix, cx)
         });
         list(side.state.clone(), move |ix, window, cx| {
-            render(ix, window, cx)
+            crate::telemetry::profile_element!("QueryMT: Sidebar row", render(ix, window, cx))
         })
         .flex_1()
         .min_h_0()
