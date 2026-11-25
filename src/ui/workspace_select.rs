@@ -17,8 +17,8 @@ use gpui_kit::*;
 use super::kit;
 use super::smooth_scroll::SmoothScroll;
 use crate::store::{AgentsStore, Endpoint};
-use crate::theme::palette;
-use crate::util::{fuzzy_score, workspace_name};
+use crate::theme::{Palette, palette};
+use crate::util::workspace_name;
 
 /// Known workspaces shown at most (they come before folders).
 const MAX_WORKSPACES: usize = 8;
@@ -73,16 +73,23 @@ fn suggestions(
 ) -> Vec<Suggestion> {
     let query = expand(input, home);
     let typed = query.trim_end_matches('/');
-    let mut ws: Vec<(u32, &String)> = workspaces
+    let candidates: Vec<&String> = workspaces
         .iter()
         .filter(|w| w.trim_end_matches('/') != typed)
-        .filter_map(|w| Some((fuzzy_score(&query, &[&workspace_name(w), w])?, w)))
         .collect();
-    ws.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    let ws: Vec<&String> = crate::search::rank_tiered(
+        &query,
+        &candidates,
+        |w| vec![workspace_name(w)],
+        |w| vec![w.to_string()],
+    )
+    .into_iter()
+    .map(|(i, _)| candidates[i])
+    .collect();
     let mut out: Vec<Suggestion> = ws
         .into_iter()
         .take(MAX_WORKSPACES)
-        .map(|(_, w)| Suggestion {
+        .map(|w| Suggestion {
             path: w.clone(),
             workspace: true,
         })
@@ -92,11 +99,17 @@ fn suggestions(
         && listed == base
     {
         let hidden = partial.starts_with('.');
-        let mut dirs: Vec<(u32, &String)> = names
+        let candidates: Vec<&String> = names
             .iter()
-            .filter(|n| hidden || !n.starts_with('.'))
-            .filter_map(|n| Some((fuzzy_score(&partial, &[n])?, n)))
+            // The matcher reads `.` as a separator, so a leading dot is
+            // applied here: it selects hidden folders.
+            .filter(|n| n.starts_with('.') == hidden)
             .collect();
+        let mut dirs: Vec<(u32, &String)> =
+            crate::search::rank(&partial, &candidates, |n| vec![n.to_string()])
+                .into_iter()
+                .map(|(i, score)| (score, candidates[i]))
+                .collect();
         dirs.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
@@ -155,12 +168,12 @@ fn list_dirs(_base: &str) -> Vec<String> {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(super) fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     dirs::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 #[cfg(target_family = "wasm")]
-pub(super) fn home_dir() -> Option<String> {
+pub(crate) fn home_dir() -> Option<String> {
     None
 }
 
@@ -181,9 +194,18 @@ pub(super) fn local_fs(store: &AgentsStore, agent: Option<&str>) -> bool {
     }
 }
 
+/// What a field tells its owner.
+#[derive(Clone, Debug)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+pub(crate) enum WorkspaceEvent {
+    /// A suggestion was chosen with Enter or a click (Tab only completes
+    /// into it). The input holds the path.
+    Picked(String),
+}
+
 /// A workspace path input with completion. Owns the completion state; the
 /// input itself is shared with whoever reads the path.
-pub(super) struct WorkspaceField {
+pub(crate) struct WorkspaceField {
     store: Entity<AgentsStore>,
     input: Entity<InputState>,
     /// Agent whose machine the path is on; `None`: the primary agent.
@@ -191,6 +213,11 @@ pub(super) struct WorkspaceField {
     /// Dialog look (faint fill, faint focus border) rather than the composer's.
     dialog: bool,
     disabled: bool,
+    /// Colours in place of the app's, for a host with a look of its own.
+    palette: Option<Palette>,
+    /// Suggestions laid out under the field, on the host's surface, instead
+    /// of in a dropdown over it (the quick panel, design D17).
+    inline: bool,
     smooth_scroll: SmoothScroll,
     open: bool,
     cursor: usize,
@@ -203,8 +230,16 @@ pub(super) struct WorkspaceField {
     _subs: Vec<Subscription>,
 }
 
+impl EventEmitter<WorkspaceEvent> for WorkspaceField {}
+
 impl WorkspaceField {
-    pub(super) fn new(
+    /// The text field.
+    #[cfg(test)]
+    pub(crate) fn input_for_test(&self) -> &Entity<InputState> {
+        &self.input
+    }
+
+    pub(crate) fn new(
         store: Entity<AgentsStore>,
         input: Entity<InputState>,
         dialog: bool,
@@ -239,6 +274,8 @@ impl WorkspaceField {
             agent: None,
             dialog,
             disabled: false,
+            palette: None,
+            inline: false,
             smooth_scroll,
             open: false,
             cursor: 0,
@@ -248,6 +285,23 @@ impl WorkspaceField {
             task: None,
             _subs: subs,
         }
+    }
+
+    /// Paint with `palette` instead of the app's.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn set_palette(&mut self, palette: Option<Palette>, cx: &mut Context<Self>) {
+        if self.palette != palette {
+            self.palette = palette;
+            cx.notify();
+        }
+    }
+
+    /// Lay the suggestions out under the field, taking room in the host's
+    /// layout, rather than in a dropdown that takes none: a host that sizes
+    /// itself to what it lays out (the quick panel) then has room for them.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub(crate) fn set_inline(&mut self, inline: bool) {
+        self.inline = inline;
     }
 
     pub(super) fn set_agent(&mut self, agent: Option<String>, cx: &mut Context<Self>) {
@@ -373,9 +427,12 @@ impl WorkspaceField {
             path
         };
         self.input
-            .update(cx, |s, cx| s.set_value(value, window, cx));
+            .update(cx, |s, cx| s.set_value(value.clone(), window, cx));
         self.open = drill;
         self.refresh_dirs(cx);
+        if !drill {
+            cx.emit(WorkspaceEvent::Picked(value));
+        }
         cx.notify();
     }
 
@@ -408,7 +465,7 @@ impl WorkspaceField {
 
 impl Render for WorkspaceField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = *palette(cx);
+        let p = self.palette.unwrap_or_else(|| *palette(cx));
         let items = self.items(cx);
         let cursor = self.cursor.min(items.len().saturating_sub(1));
         let shell = if self.dialog {
@@ -446,9 +503,17 @@ impl Render for WorkspaceField {
                 }
             }))
             .child(kit::icon(IconName::FolderSearch, 15., p.dim))
+            // A host with a look of its own: the field's placeholder,
+            // selection and caret in its colours too.
+            .when(self.palette.is_some(), |el| {
+                el.child(kit::input_colours(&self.input, &p))
+            })
             .child(
                 Input::new(&self.input)
                     .appearance(false)
+                    // The palette it is drawn in (the quick panel's is dark
+                    // whatever the app theme), not the app theme's.
+                    .text_color(p.text)
                     .aria_label("Workspace")
                     .disabled(self.disabled)
                     .flex_1(),
@@ -463,6 +528,7 @@ impl Render for WorkspaceField {
                     let path = item.path.clone();
                     h_flex()
                         .id(kit::keyed("ws-suggestion", item.path.clone()))
+                        .debug_selector(move || format!("ws-suggestion:{ix}"))
                         .flex_none()
                         .h(px(30.))
                         .px_2()
@@ -514,6 +580,21 @@ impl Render for WorkspaceField {
                         .into_any_element()
                 })
                 .collect();
+            if self.inline {
+                // On the host's surface: no box, border or shadow of its own.
+                return v_flex()
+                    .id("ws-suggestions")
+                    .debug_selector(|| "ws-suggestions".into())
+                    .mt_1()
+                    .max_h(px(LIST_MAX_H))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    // Keep focus in the field, as the dropdown does.
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .children(rows)
+                    .map(|el| self.smooth_scroll.region("workspace-list", el))
+                    .into_any_element();
+            }
             deferred(
                 v_flex()
                     .id("ws-suggestions")
@@ -539,6 +620,7 @@ impl Render for WorkspaceField {
                     .map(|el| self.smooth_scroll.region("workspace-list", el)),
             )
             .with_priority(3)
+            .into_any_element()
         });
         div().relative().w_full().child(field).children(popover)
     }

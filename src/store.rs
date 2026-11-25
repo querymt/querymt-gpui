@@ -8,25 +8,36 @@ pub(crate) mod agent_log;
 pub(crate) mod automations;
 pub(crate) mod delegates;
 mod devtools;
+mod early_commands;
 pub(crate) mod fork;
 pub(crate) mod launch;
 pub(crate) mod mcp_notice;
 mod mesh_live;
 mod pins;
+mod plans;
 pub(crate) mod plugins;
 pub(crate) mod setup;
 pub(crate) mod sidebar;
 pub(crate) mod worktree;
 
+#[cfg(test)]
+mod open_tests;
+
 use std::{collections::HashMap, rc::Rc, time::Duration};
 
-use gpui_kit::{AsyncApp, Context, Image, ImageFormat, Task, WeakEntity};
+use gpui_kit::{
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Image, ImageFormat,
+    Subscription, Task, WeakEntity,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::Instrument as _;
 
 use crate::rpc::{Incoming, RpcClient};
-use crate::session::{ParentSession, SessionView, UndoFrame, UserAttachment};
+use crate::session::open::{
+    Delivery, Link, OpenSession, OpenSessionEvent, SessionCaps, SessionKey, SessionRef,
+};
+use crate::session::{ListedPlan, SessionView};
 use crate::transport::{self, Inbound, Target};
 use crate::util::now_ms;
 
@@ -159,7 +170,7 @@ pub struct Model {
     pub context: Option<u64>,
     /// Known input modalities (`text`, `image`, `pdf`, …); empty when unknown.
     pub modalities: Vec<String>,
-    raw: Value,
+    pub(crate) raw: Value,
 }
 
 /// Selection key of a model (desktop `getModelSelectionKey`): its id, or for
@@ -171,6 +182,12 @@ pub fn model_key(id: &str, node_id: Option<&str>) -> String {
         None => id.to_string(),
     }
 }
+
+/// Delay before queued session inputs are applied as one batch (about half a
+/// frame at 60 Hz).
+pub(crate) const SESSION_FLUSH_MS: u64 = 8;
+/// A load response larger than this is decoded off the UI thread (native).
+pub(crate) const HYDRATE_BYTES: usize = 256 * 1024;
 
 const REMOTE_MODEL_KEY: &str = "querymt:model:";
 
@@ -242,6 +259,9 @@ pub struct SessionSummary {
     pub has_children: bool,
     pub worktree: Option<Worktree>,
     pub remote: Option<RemoteOwner>,
+    /// `items` plans from `_meta["querymt/plans"]`, kept current by
+    /// `querymt/session/plansChanged`. Empty for agents that send none.
+    pub plans: Vec<ListedPlan>,
 }
 
 /// Managed Git worktree a session runs in (`_meta.querymt.workspace`).
@@ -384,6 +404,7 @@ impl SessionSummary {
             has_children: m("hasChildren").and_then(Value::as_bool) == Some(true),
             worktree,
             remote,
+            plans: ListedPlan::parse_all(m("querymt/plans")),
         }
     }
 
@@ -434,16 +455,6 @@ impl Attachment {
 
     pub fn is_image(&self) -> bool {
         self.mime.starts_with("image/")
-    }
-
-    /// Transcript representation of this attachment (keeps image bytes for the thumbnail).
-    pub fn to_user_attachment(&self) -> UserAttachment {
-        UserAttachment {
-            name: self.name.clone(),
-            mime: self.mime.clone(),
-            size: Some(self.size),
-            data: self.is_image().then(|| self.data.clone()),
-        }
     }
 }
 
@@ -930,21 +941,7 @@ fn parse_request(
             })
             .collect();
         // Reuse the transcript's tool parsing for the command / path preview.
-        let summary = {
-            let mut call = crate::session::SessionView::default();
-            let mut update = tool.clone();
-            if let Some(obj) = update.as_object_mut() {
-                obj.insert("sessionUpdate".into(), Value::from("tool_call"));
-            }
-            call.apply(&update);
-            match call.items.first().map(|i| &i.kind) {
-                Some(crate::session::ItemKind::Work(entries)) => match entries.first() {
-                    Some(crate::session::WorkEntry::Tool(c)) => c.summary(),
-                    _ => String::new(),
-                },
-                _ => String::new(),
-            }
-        };
+        let summary = crate::session::SessionView::tool_call_summary(tool);
         let fallback = str_at(tool, "toolCallId")
             .filter(|id| !id.is_empty())
             .map(|tc| format!("tc:{}:{tc}", session_id.as_deref().unwrap_or_default()));
@@ -1225,7 +1222,8 @@ pub struct AgentRuntime {
     pub failed_plugins: Vec<(String, String)>,
     /// The plugin update step in progress.
     pub plugin_progress: Option<plugins::PluginProgress>,
-    /// Names of actions in flight (e.g. `invite`, `key:xai`).
+    /// Names of actions in flight on the current connection (e.g. `invite`,
+    /// `key:xai`); a connect or disconnect clears them.
     pub pending: std::collections::HashSet<String>,
     pub log: agent_log::AgentLog,
     /// JSON-RPC traffic across reconnects (debug events, Developer mode).
@@ -1473,6 +1471,58 @@ pub struct Prefs {
     /// Developer-only tools: protocol debug events, message metadata.
     #[serde(default)]
     pub developer_mode: bool,
+    /// The quick panel (desktop only).
+    #[serde(default)]
+    pub quick: QuickPrefs,
+}
+
+/// Settings of the quick panel. Off until the end-to-end checks on every
+/// platform pass (change `quick-panel-default` then).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickPrefs {
+    /// The panel, its shortcut, the tray icon and the background mode are on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Global shortcut in `global-hotkey` form (`alt+Space`); empty: the
+    /// platform default.
+    #[serde(default)]
+    pub shortcut: String,
+    /// How the session picker lays its sessions out.
+    #[serde(default)]
+    pub picker_layout: PickerLayout,
+    /// Where the user left the panel, per display (its uuid, else its id).
+    #[serde(default)]
+    pub positions: std::collections::BTreeMap<String, QuickPosition>,
+}
+
+/// Where the user left the quick panel on one display: its edges in logical
+/// pixels from the display's top-left corner. Which edge is kept on reopening
+/// is the one the platform keeps while the panel grows (design D18).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickPosition {
+    pub left: i32,
+    pub top: i32,
+    pub bottom: i32,
+}
+
+/// The quick panel's session picker: one line per session, or cards in two
+/// columns with each session's progress.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerLayout {
+    #[default]
+    List,
+    Grid,
+}
+
+impl PickerLayout {
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub fn other(self) -> Self {
+        match self {
+            Self::List => Self::Grid,
+            Self::Grid => Self::List,
+        }
+    }
 }
 
 impl Prefs {
@@ -1566,6 +1616,13 @@ fn load_persisted() -> Option<Persisted> {
         .get_item("querymt-gpui:state")
         .ok()??;
     serde_json::from_str(&text).ok()
+}
+
+/// The quick panel settings as saved, read before the app starts (a second
+/// instance decides from them whether to forward its request).
+#[cfg(not(target_family = "wasm"))]
+pub fn persisted_quick_prefs() -> QuickPrefs {
+    load_persisted().map(|p| p.prefs.quick).unwrap_or_default()
 }
 
 fn save_persisted(state: &Persisted) {
@@ -1683,27 +1740,48 @@ fn seed_configs() -> Vec<AgentConfig> {
 // ---------------------------------------------------------------------------
 // Store
 
+/// The start page's choice of where the next session runs. A launch copies it
+/// into its [`launch::LaunchRequest`]; its progress belongs to the caller.
 #[derive(Default)]
 pub struct LaunchState {
-    pub busy: bool,
-    pub error: Option<String>,
-    pub last_started: Option<String>,
     /// Mesh peer the next session runs on; `None`: the agent's machine.
     pub target: Option<String>,
     /// Worktree placement of the next local session.
     pub worktree: launch::WorktreeMode,
     /// Profile on the target peer; `None`: the peer's active profile.
     pub remote_profile: Option<String>,
-    /// Peer the session being created runs on, for the placeholder.
-    pub creating_on: Option<String>,
 }
+
+/// The open sessions. The index is weak: a session lives exactly as long as
+/// some surface holds its entity.
+#[derive(Default)]
+struct OpenSessions {
+    hub: HashMap<SessionKey, WeakEntity<OpenSession>>,
+    /// What the store hears from each live session.
+    subs: HashMap<SessionKey, Subscription>,
+    /// A session a test window starts with in its main pane.
+    #[cfg(test)]
+    test_main: Option<Entity<OpenSession>>,
+}
+
+/// What the store tells every surface that shows sessions.
+#[derive(Clone, Debug)]
+pub(crate) enum StoreEvent {
+    /// A session was made from `from` (a fork, a worktree). A surface that
+    /// shows `from` may switch to `child`.
+    Spawned { from: SessionKey, child: SessionRef },
+    /// The agent deleted this session.
+    Deleted(SessionKey),
+}
+
+impl EventEmitter<StoreEvent> for AgentsStore {}
 
 pub struct AgentsStore {
     pub configs: Vec<AgentConfig>,
     pub prefs: Prefs,
     pub launch: LaunchState,
-    /// The session open in the transcript view.
-    pub session: Option<SessionView>,
+    /// The sessions open in the app (design D1).
+    open_sessions: OpenSessions,
     /// Permission and input requests waiting for the user (the Inbox).
     pub requests: Vec<PendingRequest>,
     runtime: HashMap<String, AgentRuntime>,
@@ -1712,7 +1790,9 @@ pub struct AgentsStore {
     pub first_run: bool,
     /// Sidebar lists: sessions already seen this run.
     sidebar: sidebar::SidebarState,
-    _launch_task: Option<Task<()>>,
+    /// Slash commands advertised for sessions that have no view yet, until
+    /// a view takes them (design D3).
+    early_commands: early_commands::EarlyCommands,
 }
 
 impl AgentsStore {
@@ -1742,12 +1822,12 @@ impl AgentsStore {
             configs,
             prefs: persisted.prefs,
             launch: LaunchState::default(),
-            session: None,
+            open_sessions: Default::default(),
             requests: Vec::new(),
             runtime: HashMap::new(),
             sidebar: Default::default(),
+            early_commands: Default::default(),
             first_run,
-            _launch_task: None,
         };
         this.save();
         let auto: Vec<String> = this
@@ -1876,6 +1956,14 @@ impl AgentsStore {
         cx.notify();
     }
 
+    /// The model a launch starts on: `choice` (a selection key) when the
+    /// agent lists it, else the launch default.
+    pub fn model_to_launch(&self, agent_id: &str, choice: Option<&str>) -> Option<&Model> {
+        choice
+            .and_then(|key| find_model(self.models(agent_id), key))
+            .or_else(|| self.launch_model(agent_id))
+    }
+
     pub fn launch_model(&self, agent_id: &str) -> Option<&Model> {
         let models = self.models(agent_id);
         self.prefs
@@ -1951,6 +2039,43 @@ impl AgentsStore {
         }
     }
 
+    /// Turn the quick panel on or off.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub fn set_quick_enabled(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.prefs.quick.enabled != on {
+            self.prefs.quick.enabled = on;
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// The shortcut of the quick panel (`global-hotkey` form).
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub fn set_quick_shortcut(&mut self, shortcut: &str, cx: &mut Context<Self>) {
+        if self.prefs.quick.shortcut != shortcut {
+            self.prefs.quick.shortcut = shortcut.to_owned();
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// Remember where the quick panel was left on `display`, in memory: the
+    /// panel writes it to disk once the window stops moving.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub fn remember_quick_position(&mut self, display: String, position: QuickPosition) {
+        self.prefs.quick.positions.insert(display, position);
+    }
+
+    /// The layout of the quick panel's session picker.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))] // used by the desktop-only quick panel
+    pub fn set_quick_picker_layout(&mut self, layout: PickerLayout, cx: &mut Context<Self>) {
+        if self.prefs.quick.picker_layout != layout {
+            self.prefs.quick.picker_layout = layout;
+            self.save();
+            cx.notify();
+        }
+    }
+
     pub fn set_primary_agent(&mut self, id: &str, cx: &mut Context<Self>) {
         self.prefs.primary_agent = Some(id.to_string());
         self.save();
@@ -1981,24 +2106,6 @@ impl AgentsStore {
         recent.retain(|k| k != key);
         recent.insert(0, key.to_string());
         recent.truncate(5);
-    }
-
-    /// Selection key of the open session's model, with a node only when it
-    /// is not the agent's own machine.
-    pub fn session_model_key(&self) -> Option<String> {
-        let view = self.session.as_ref()?;
-        let own = self
-            .runtime(&view.agent_id)
-            .and_then(|rt| rt.mesh.as_ref())
-            .and_then(|m| m.peer_id.as_deref());
-        let node = view.model_node.as_deref().filter(|n| Some(*n) != own);
-        Some(model_key(view.model.as_deref()?, node))
-    }
-
-    /// The open session's model in its agent's catalog.
-    pub fn session_model(&self) -> Option<&Model> {
-        let view = self.session.as_ref()?;
-        find_model(self.models(&view.agent_id), &self.session_model_key()?)
     }
 
     pub fn set_launch_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
@@ -2112,12 +2219,7 @@ impl AgentsStore {
                         for list in rt.children.values_mut() {
                             list.sessions.retain(|x| x.id != session_id);
                         }
-                        if s.session
-                            .as_ref()
-                            .is_some_and(|v| v.agent_id == agent_id && v.session_id == session_id)
-                        {
-                            s.session = None;
-                        }
+                        cx.emit(StoreEvent::Deleted(SessionKey::new(&agent_id, &session_id)));
                     }
                     Err(err) => rt.end_session_action(
                         &session_id,
@@ -2249,9 +2351,8 @@ impl AgentsStore {
         }
         self.runtime.clear();
         self.requests.clear();
-        self.session = None;
+        self.open_sessions = OpenSessions::default();
         self.launch = LaunchState::default();
-        self._launch_task = None;
         self.prefs = Prefs::default();
         self.configs = seed_configs();
         // Starts over like a fresh install, setup included.
@@ -2271,7 +2372,9 @@ impl AgentsStore {
 
     // ---- extension calls (mesh, auth) --------------------------------------
 
-    /// Call an agent extension method; `then` runs on the store with the result.
+    /// Call an agent extension method; `then` runs on the store with the
+    /// result. A connect or disconnect in between makes the answer moot: it
+    /// then changes nothing (the new generation cleared the pending tag).
     fn ext(
         &mut self,
         id: &str,
@@ -2291,16 +2394,17 @@ impl AgentsStore {
         };
         rt.action_error = None;
         rt.pending.insert(tag.to_string());
+        let (generation, id, tag) = (rt.generation, id.to_string(), tag.to_string());
         cx.notify();
-        let (id, tag) = (id.to_string(), tag.to_string());
         cx.spawn(async move |this, cx| {
             let result = rpc.request(method, params).await;
             let _ = this.update(cx, |s, cx| {
-                if let Some(rt) = s.runtime.get_mut(&id) {
-                    rt.pending.remove(&tag);
-                    if let Err(err) = &result {
-                        rt.action_error = Some(err.clone());
-                    }
+                let Some(rt) = s.live(&id, generation) else {
+                    return;
+                };
+                rt.pending.remove(&tag);
+                if let Err(err) = &result {
+                    rt.action_error = Some(err.clone());
                 }
                 then(s, &id, result, cx);
                 cx.notify();
@@ -2573,6 +2677,8 @@ impl AgentsStore {
         };
         let config_id = config.id.clone();
         let developer = self.prefs.developer_mode;
+        // A new connection generation: what the old one advertised is stale.
+        self.early_commands.clear_agent(id);
         let rt = self.runtime.entry(id.to_string()).or_default();
         rt.wire.set_enabled(developer);
         if let Some(rpc) = rt.rpc.take() {
@@ -2580,6 +2686,8 @@ impl AgentsStore {
         }
         rt.tasks.clear();
         rt.generation += 1;
+        // Actions in flight belonged to the old connection.
+        rt.pending.clear();
         let generation = rt.generation;
         rt.schedules = Default::default();
         rt.providers_loaded = false;
@@ -2670,9 +2778,14 @@ impl AgentsStore {
                         // `_meta.querymt.sessionLoadSnapshot.epoch` (as the desktop app): the
                         // transcript is built from the `session/load` snapshot, so the agent
                         // skips the historical `session/update` replay.
+                        // `plan` (the todo list as `plan_update`) and `subagents`
+                        // (`subagent_update`, tool-call session links): the session
+                        // reducer is tested against exactly these shapes.
                         "clientCapabilities": {
                             "fs": {},
                             "terminal": false,
+                            "plan": {},
+                            "subagents": {},
                             "session": { "compaction": {} },
                             "elicitation": { "form": {} },
                             "_meta": { "querymt": { "sessionLoadSnapshot": { "epoch": 1 } } },
@@ -2712,11 +2825,9 @@ impl AgentsStore {
                     rt.agent_title.as_deref().unwrap_or("agent"),
                     rt.agent_version.as_deref().unwrap_or("")
                 ));
-                // The open session's live updates were lost with the old
-                // connection: load it again on the new one.
-                if reconnected && s.session.as_ref().is_some_and(|v| v.agent_id == id) {
-                    s.reload_session(cx);
-                }
+                // The live updates of the open sessions were lost with the
+                // old connection: load them again on the new one.
+                s.rebind_sessions(&id, reconnected, cx);
                 cx.notify();
             });
             load_details(this, id, generation, rpc, cx).await;
@@ -2727,8 +2838,11 @@ impl AgentsStore {
     }
 
     pub fn disconnect(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.early_commands.clear_agent(id);
         if let Some(rt) = self.runtime.get_mut(id) {
             rt.generation += 1;
+            // Actions in flight belonged to the old connection.
+            rt.pending.clear();
             rt.reconnect_attempt = 0;
             if let Some(rpc) = rt.rpc.take() {
                 rpc.close();
@@ -2738,6 +2852,7 @@ impl AgentsStore {
             rt.pid = None;
             rt.log("Disconnected.");
             self.retire_requests(id);
+            self.rebind_sessions(id, false, cx);
             cx.notify();
         }
     }
@@ -2771,35 +2886,43 @@ impl AgentsStore {
 
     // ---- session launch -----------------------------------------------------
 
-    /// `session/new` → optional model selection → `session/prompt` (not awaited).
+    /// `session/new` → optional model selection → `session/prompt` (not
+    /// awaited). The task resolves to the new session, which only the caller
+    /// shows; dropping the task cancels the launch (`Task` is `#[must_use]`,
+    /// so an ignored launch is a compile warning).
     pub fn launch(
         &mut self,
-        agent_id: &str,
-        cwd: String,
-        prompt: String,
-        attachments: Vec<Attachment>,
+        request: launch::LaunchRequest,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Task<Result<Entity<OpenSession>, launch::LaunchError>> {
+        let launch::LaunchRequest {
+            agent_id,
+            cwd,
+            prompt,
+            attachments,
+            placement,
+            model,
+            reasoning,
+        } = request;
+        let agent_id = agent_id.as_str();
         let Some(rpc) = self.runtime.get(agent_id).and_then(|r| r.rpc.clone()) else {
-            self.launch.error = Some("The selected agent is not connected.".into());
-            cx.notify();
-            return;
+            return Task::ready(Err(launch::LaunchError::NotConnected));
         };
-        let model = self.launch_model(agent_id).cloned();
+        let model = self.model_to_launch(agent_id, model.as_deref()).cloned();
         // A mesh peer creates the session through the agent and owns it; this
         // machine creates it with `session/new`, in a worktree when chosen.
-        let target = self.launch.target.clone();
+        let target = placement.target.clone();
         let (method, params) = match &target {
             Some(node) => (
                 "_querymt/remote/createSession",
-                launch::remote_session_params(node, &cwd, self.launch.remote_profile.as_deref()),
+                launch::remote_session_params(node, &cwd, placement.remote_profile.as_deref()),
             ),
             None => (
                 "session/new",
                 launch::new_session_params(
                     &cwd,
                     self.launch_profile(agent_id),
-                    self.launch_worktree(agent_id),
+                    self.worktree_for(agent_id, &placement),
                 ),
             ),
         };
@@ -2816,7 +2939,7 @@ impl AgentsStore {
         // was listed: check right before creating (desktop `launchSession`).
         let profile_check = target
             .clone()
-            .zip(self.launch.remote_profile.clone())
+            .zip(placement.remote_profile.clone())
             .filter(|_| {
                 self.runtime
                     .get(agent_id)
@@ -2824,36 +2947,33 @@ impl AgentsStore {
             });
         let image_mode = self.prefs.image_send_mode;
         let mode = self.prefs.mode().to_string();
-        let reasoning = self.prefs.reasoning().to_string();
-        self.launch.busy = true;
-        self.launch.error = None;
-        self.launch.last_started = None;
-        self.launch.creating_on = remote
-            .as_ref()
-            .map(|r| r.label.clone().unwrap_or_else(|| r.node_id.clone()));
-        self.session = None;
+        let reasoning = reasoning.unwrap_or_else(|| self.prefs.reasoning().to_string());
         self.set_cwd(cwd.clone());
         cx.notify();
 
         let agent_id = agent_id.to_string();
-        self._launch_task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<String, String> = async {
+        cx.spawn(async move |this, cx| {
+            use launch::LaunchError;
+            async {
                 if let Some((node, profile)) = profile_check {
                     let listed = launch::request_peer_profiles(&rpc, &node).await;
                     let _ = this.update(cx, |s, cx| {
                         s.store_peer_profiles(&agent_id, &node, &listed);
                         cx.notify();
                     });
-                    if !listed?.iter().any(|p| p.id == profile) {
-                        return Err(launch::MISSING_PEER_PROFILE.to_string());
+                    if !listed.map_err(LaunchError::Create)?.iter().any(|p| p.id == profile) {
+                        return Err(LaunchError::PeerProfileGone);
                     }
                 }
-                let created = rpc.request(method, params).await?;
+                let created = rpc
+                    .request(method, params)
+                    .await
+                    .map_err(LaunchError::Create)?;
                 let session_id = created
                     .get("sessionId")
                     .or_else(|| created.get("session_id"))
                     .and_then(Value::as_str)
-                    .ok_or("Agent did not return a session id.")?
+                    .ok_or_else(|| LaunchError::Create("Agent did not return a session id.".into()))?
                     .to_string();
                 let skipped = mcp_notice::from_response(&created);
                 let _ = this.update(cx, |s, _| {
@@ -2926,30 +3046,23 @@ impl AgentsStore {
                         _ => log(format!("Reasoning effort {reasoning} is not offered for this model."), cx),
                     }
                 }
-                let _ = this.update(cx, |s, cx| {
+                let first_prompt = prompt_content(&prompt, &attachments, image_mode);
+                let session = this.update(cx, |s, cx| {
                     let mut view = SessionView::new(&agent_id, &session_id, &cwd, &prompt.chars().take(80).collect::<String>());
-                    view.push_local_user(&prompt, attachments.iter().map(Attachment::to_user_attachment).collect());
-                    view.prompting = true;
-                    view.sync_work(crate::util::now_ms());
+                    // Commands advertised since `session/new` go in first.
+                    s.take_early_commands(&mut view);
                     view.apply_modes(created.get("modes"));
                     view.options = options.clone();
                     view.mode = Some(mode.clone());
                     view.model = model.as_ref().map(|m| m.id.clone());
                     view.model_node = model.as_ref().and_then(|m| m.node_id.clone());
-                    s.session = Some(view);
+                    let session = s.adopt(view, cx);
+                    // The prompt resolves when the turn ends; it keeps running in the background.
+                    session.update(cx, |o, cx| o.start_prompt(&first_prompt, cx));
                     cx.notify();
-                });
-                // The prompt resolves when the turn ends; keep it running in the background.
-                let turn = rpc.request(
-                    "session/prompt",
-                    json!({ "sessionId": session_id, "prompt": prompt_content(&prompt, &attachments, image_mode) }),
-                );
-                let (this2, agent_id2, session_id2) = (this.clone(), agent_id.clone(), session_id.clone());
-                cx.spawn(async move |cx| {
-                    let result = turn.await;
-                    let _ = this2.update(cx, |s, cx| s.finish_prompt(&agent_id2, &session_id2, result, cx));
+                    session
                 })
-                .detach();
+                .map_err(|_| LaunchError::Create("The app closed before the session started.".into()))?;
                 let _ = this.update(cx, |s, cx| {
                     if let Some(rt) = s.runtime.get_mut(&agent_id) {
                         rt.sessions.insert(
@@ -2971,884 +3084,278 @@ impl AgentsStore {
                     }
                     s.schedule_sessions_refresh(&agent_id, Duration::from_millis(1500), cx);
                 });
-                Ok(session_id)
+                Ok(session)
             }
-            .await;
-            let _ = this.update(cx, |s, cx| {
-                s.launch.busy = false;
-                s.launch.creating_on = None;
-                match result {
-                    Ok(id) => s.launch.last_started = Some(id),
-                    Err(err) => s.launch.error = Some(err),
-                }
-                cx.notify();
-            });
-        }));
+            .await
+        })
     }
 
     // ---- session view -------------------------------------------------------
 
-    /// Open a session in the transcript view, built from the `session/load` snapshot.
-    pub fn open_session(
-        &mut self,
-        agent_id: &str,
-        session_id: &str,
-        cwd: &str,
-        title: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if self.session.as_ref().is_some_and(|v| {
-            v.agent_id == agent_id && v.session_id == session_id && v.error.is_none()
-        }) {
-            return;
+    /// The live entity of `key`; a dead index entry is pruned.
+    fn live_session(&mut self, key: &SessionKey) -> Option<Entity<OpenSession>> {
+        match self.open_sessions.hub.get(key)?.upgrade() {
+            Some(entity) => Some(entity),
+            None => {
+                self.open_sessions.hub.remove(key);
+                self.open_sessions.subs.remove(key);
+                None
+            }
         }
-        self.remember_recent_session(agent_id, session_id);
-        let mut view = SessionView::new(agent_id, session_id, cwd, title);
-        let Some(rt) = self.runtime.get(agent_id) else {
-            return;
-        };
-        if let Some(s) = rt.sessions.iter().find(|s| s.id == session_id) {
-            view.phase = s.phase.clone();
-        }
-        let Some(rpc) = rt.rpc.clone().filter(|_| rt.is_connected()) else {
-            view.error = Some("The agent of this session is not connected.".into());
-            self.session = Some(view);
-            cx.notify();
-            return;
-        };
+    }
+
+    /// Some open session is waiting for its load response.
+    fn any_session_loading(&self, cx: &App) -> bool {
+        self.open_sessions
+            .hub
+            .values()
+            .filter_map(WeakEntity::upgrade)
+            .any(|session| session.read(cx).view.loading)
+    }
+
+    /// What `OpenSession`s of `agent_id` get to talk to the agent with.
+    fn link_for(&self, agent_id: &str) -> Link {
+        let rt = self.runtime.get(agent_id);
+        let has = |method: &str| rt.is_some_and(|rt| rt.supports_method(method));
+        let config = self.configs.iter().find(|c| c.id == agent_id);
+        let agent_line = rt
+            .map(|rt| {
+                format!(
+                    "{} ({}) · {} {}",
+                    config.map_or(agent_id, |c| c.name.as_str()),
+                    config.map(AgentConfig::endpoint_label).unwrap_or_default(),
+                    rt.agent_title.as_deref().unwrap_or("unknown agent"),
+                    rt.agent_version.as_deref().unwrap_or(""),
+                )
+            })
+            .unwrap_or_default();
         let windowed = rt
-            .capabilities
-            .as_ref()
+            .and_then(|rt| rt.capabilities.as_ref())
             .and_then(|c| c.pointer("/features/session_history_window"))
             .and_then(Value::as_bool)
             == Some(true);
-        view.loading = true;
-        self.session = Some(view);
-        cx.notify();
-
-        let mut params = json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] });
-        if windowed {
-            params["_meta"] = json!({ "querymt": { "loadWindow": { "maxTurns": 20, "maxBytes": 1048576, "truncateBytes": 32768 } } });
-        }
-        // Context for the diagnostic report, captured before the request.
-        let agent_line = {
-            let config = self.configs.iter().find(|c| c.id == agent_id);
-            format!(
-                "{} ({}) · {} {}",
-                config.map_or(agent_id, |c| c.name.as_str()),
-                config.map(AgentConfig::endpoint_label).unwrap_or_default(),
-                rt.agent_title.as_deref().unwrap_or("unknown agent"),
-                rt.agent_version.as_deref().unwrap_or(""),
-            )
-        };
-        let request_params = params.clone();
-        let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
-        let load_span = tracing::info_span!(
-            "session.open",
-            session.windowed = windowed,
-            session.items = tracing::field::Empty,
-            session.apply_ms = tracing::field::Empty,
-            session.error = tracing::field::Empty,
-        );
-        crate::telemetry::mark_session_open(&session_id);
-        cx.spawn(async move |this, cx| {
-            let started = now_ms();
-            let result = rpc
-                .request_detailed("session/load", params)
-                .instrument(load_span.clone())
-                .await;
-            let elapsed_ms = now_ms() - started;
-            let apply_started = now_ms();
-            let _ = this.update(cx, |s, cx| {
-                let Some(view) = s
-                    .session
-                    .as_mut()
-                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-                else {
-                    return;
-                };
-                view.loading = false;
-                match result {
-                    Ok(v) => {
-                        view.access = crate::session::SessionAccess::parse(&v);
-                        if let Some(rt) = s.runtime.get_mut(&agent_id) {
-                            mcp_notice::record(
-                                rt,
-                                &session_id,
-                                mcp_notice::from_response(&v),
-                                false,
-                            );
-                        }
-                        view.apply_config(v.get("configOptions"));
-                        view.apply_modes(v.get("modes"));
-                        let snap = v.pointer("/_meta/querymt~1sessionLoadSnapshot.v1");
-                        if let Some(rt) = snap.and_then(|s| s.get("runtimeStatus")) {
-                            view.apply_runtime(rt);
-                        }
-                        if let Some(snap) = snap {
-                            view.apply_load_snapshot(snap);
-                        }
-                        view.sync_work(crate::util::now_ms());
-                        view.history_more = snap
-                            .and_then(|s| s.pointer("/history/complete"))
-                            .and_then(Value::as_bool)
-                            == Some(false);
-                        view.history_before = snap
-                            .and_then(|s| s.pointer("/history/before"))
-                            .and_then(Value::as_str)
-                            .filter(|_| view.history_more)
-                            .map(str::to_owned);
-                        if let Some(notice) = view.after_load_notice.take() {
-                            view.push_notice(notice, false);
-                        }
-                    }
-                    Err(err) => {
-                        view.error = Some(format!("Could not load the session: {err}"));
-                        view.error_details = Some(load_error_report(
-                            &agent_line,
-                            &request_params,
-                            &err,
-                            elapsed_ms,
-                        ));
-                    }
-                }
-                if let Some(view) = s.session.as_ref() {
-                    load_span.record("session.items", view.items.len());
-                    if let Some(err) = &view.error {
-                        load_span.record("session.error", err.as_str());
-                    }
-                }
-                s.refresh_undo_stack(cx);
-                s.refresh_delegates(cx);
-                cx.notify();
-            });
-            load_span.record("session.apply_ms", now_ms() - apply_started);
-        })
-        .detach();
-    }
-
-    /// Fetch the turns preceding the loaded transcript (`_querymt/session/history`)
-    /// and prepend them. One page in flight at a time; triggered when the user
-    /// scrolls near the top.
-    pub fn load_older_history(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_mut() else {
-            return;
-        };
-        if view.history_loading || view.history_error.is_some() {
-            return;
-        }
-        let Some(before) = view.history_before.clone() else {
-            return;
-        };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
-            return;
-        };
-        view.history_loading = true;
-        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        cx.notify();
-        let req = rpc.request(
-            "_querymt/session/history",
-            json!({
-                "sessionId": session_id,
-                "before": before,
-                "loadWindow": { "maxTurns": 20, "maxBytes": 1048576, "truncateBytes": 32768 },
-            }),
-        );
-        cx.spawn(async move |this, cx| {
-            let result = req.await;
-            let _ = this.update(cx, |s, cx| {
-                let Some(view) = s
-                    .session
-                    .as_mut()
-                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-                else {
-                    return;
-                };
-                view.history_loading = false;
-                match result {
-                    Ok(page) => {
-                        let events = page
-                            .get("events")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        let prompts = page
-                            .get("userPrompts")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        view.prepend_events(&events, &prompts);
-                        view.apply_truncation(page.get("truncated"));
-                        crate::telemetry::record_history_load("ok");
-                        tracing::info!(events = events.len(), "older history page loaded");
-                        let complete = page
-                            .pointer("/history/complete")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(true);
-                        view.history_before = page
-                            .pointer("/history/before")
-                            .and_then(Value::as_str)
-                            .filter(|_| !complete)
-                            .map(str::to_owned);
-                        view.history_more = view.history_before.is_some();
-                    }
-                    // An undo rewrote history: the cursor is void, reload from scratch.
-                    Err(err) if err.contains("history_changed") => {
-                        crate::telemetry::record_history_load("history_changed");
-                        cx.notify();
-                        s.reload_session(cx);
-                        return;
-                    }
-                    Err(err) => {
-                        crate::telemetry::record_history_load("error");
-                        tracing::warn!(error = %err, "older history page failed");
-                        view.history_error = Some(err);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Clear a failed older-history fetch and try again.
-    /// The open session's agent returns complete tool content a load shortened.
-    pub fn supports_tool_content(&self) -> bool {
-        self.session
-            .as_ref()
-            .and_then(|v| self.runtime(&v.agent_id))
-            .is_some_and(|rt| rt.supports_method("querymt/session/toolContent"))
-    }
-
-    /// Fetch the complete `part` (`result` or `arguments`) of tool call `id`
-    /// of the open session, which a windowed load shortened.
-    pub fn load_tool_content(&mut self, id: &str, part: &'static str, cx: &mut Context<Self>) {
-        if !self.supports_tool_content() {
-            return;
-        }
-        let Some(rpc) = self
-            .session
-            .as_ref()
-            .and_then(|v| self.runtime(&v.agent_id))
-            .and_then(|rt| rt.rpc.clone())
-        else {
-            return;
-        };
-        let Some(view) = self.session.as_mut() else {
-            return;
-        };
-        let Some(call) = view.truncated_tool(id) else {
-            return;
-        };
-        let shortened = match part {
-            "result" => call.truncated_result.is_some(),
-            _ => call.truncated_args.is_some(),
-        };
-        if !shortened || matches!(call.fetch, Some(crate::session::ContentFetch::Loading(_))) {
-            return;
-        }
-        let (agent, session, id) = (
-            view.agent_id.clone(),
-            view.session_id.clone(),
-            id.to_owned(),
-        );
-        view.set_tool_fetch(&id, Some(crate::session::ContentFetch::Loading(part)));
-        cx.notify();
-        let request = rpc.request(
-            "_querymt/session/toolContent",
-            json!({ "sessionId": session, "toolCallId": id, "part": part }),
-        );
-        cx.spawn(async move |this, cx| {
-            let result = request.await.and_then(|v| {
-                v.get("content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| "The agent returned no content.".to_string())
-            });
-            let _ = this.update(cx, |s, cx| {
-                let Some(view) = s
-                    .session
-                    .as_mut()
-                    .filter(|v| v.agent_id == agent && v.session_id == session)
-                else {
-                    return;
-                };
-                match result {
-                    Ok(content) => view.set_full_tool_content(&id, part, content),
-                    Err(error) => {
-                        tracing::warn!(%error, tool = %id, part, "tool content fetch failed");
-                        view.set_tool_fetch(
-                            &id,
-                            Some(crate::session::ContentFetch::Failed(format!(
-                                "Could not load the full {}: {error}",
-                                if part == "result" {
-                                    "output"
-                                } else {
-                                    "parameters"
-                                }
-                            ))),
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    pub fn retry_older_history(&mut self, cx: &mut Context<Self>) {
-        if let Some(view) = self.session.as_mut() {
-            view.history_error = None;
-        }
-        self.load_older_history(cx);
-    }
-
-    /// Close and load the open session again.
-    /// Agent of the open session supports workspace undo and redo.
-    pub fn session_supports_undo(&self) -> bool {
-        self.session
-            .as_ref()
-            .filter(|v| v.access.is_none())
-            .and_then(|v| self.runtime.get(&v.agent_id))
-            .is_some_and(|rt| {
-                [
+        Link {
+            rpc: rt.and_then(|rt| rt.rpc.clone()),
+            connected: rt.is_some_and(AgentRuntime::is_connected),
+            generation: rt.map_or(0, |rt| rt.generation),
+            caps: SessionCaps {
+                can_control_run: rt.is_some_and(AgentRuntime::can_control_run),
+                tool_content: has("querymt/session/toolContent"),
+                undo: [
                     "querymt/session/undoStack",
                     "querymt/session/undo",
                     "querymt/session/redo",
                 ]
                 .iter()
-                .all(|m| rt.supports_method(m))
-            })
+                .all(|m| has(m)),
+                discard_queued: has("querymt/session/discardQueuedInput"),
+                history_window: windowed,
+            },
+            agent_line,
+        }
     }
 
-    /// Fetch the open session's workspace undo stack (`querymt/session/undoStack`).
-    pub fn refresh_undo_stack(&mut self, cx: &mut Context<Self>) {
-        if !self.session_supports_undo() {
-            return;
-        }
-        let Some(view) = self.session.as_ref() else {
-            return;
-        };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
-            return;
-        };
-        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let req = rpc.request(
-            "_querymt/session/undoStack",
-            json!({ "session_id": session_id }),
-        );
-        cx.spawn(async move |this, cx| {
-            let Ok(resp) = req.await else { return };
-            let _ = this.update(cx, |s, cx| {
-                if let Some(view) = s
-                    .session
-                    .as_mut()
-                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-                {
-                    view.undo_stack = UndoFrame::parse_stack(&resp);
-                    cx.notify();
+    /// Give every live session of `agent_id` the agent's current link, and
+    /// load each again when `reload` (their live updates were lost with the
+    /// old connection).
+    pub(crate) fn rebind_sessions(&mut self, agent_id: &str, reload: bool, cx: &mut Context<Self>) {
+        let link = self.link_for(agent_id);
+        let live: Vec<Entity<OpenSession>> = self
+            .open_sessions
+            .hub
+            .values()
+            .filter_map(WeakEntity::upgrade)
+            .filter(|session| session.read(cx).key.agent.as_str() == agent_id)
+            .collect();
+        for session in live {
+            let link = link.clone();
+            session.update(cx, |o, cx| {
+                o.rebind(link, cx);
+                if reload {
+                    o.reload(cx);
                 }
             });
-        })
-        .detach();
+        }
     }
 
-    /// Revert the workspace to before the latest undoable turn
-    /// (`querymt/session/undo`), then reload the transcript.
-    /// Revert the workspace to before the user turn `message_id` (and every
-    /// later turn), then reload the transcript.
-    pub fn undo_workspace_to(&mut self, message_id: String, cx: &mut Context<Self>) {
-        self.start_undo_op(Some(message_id), cx);
+    /// Read the open session `key`, if it is open.
+    pub(crate) fn with_session<R>(
+        &self,
+        key: &SessionKey,
+        cx: &App,
+        read: impl FnOnce(&SessionView) -> R,
+    ) -> Option<R> {
+        let session = self.open_sessions.hub.get(key)?.upgrade()?;
+        Some(read(&session.read(cx).view))
+    }
+
+    /// Entity for `view`, indexed weakly and heard by the store.
+    fn adopt(&mut self, view: SessionView, cx: &mut Context<Self>) -> Entity<OpenSession> {
+        let key = SessionKey::new(&view.agent_id, &view.session_id);
+        let link = self.link_for(key.agent.as_str());
+        let session = cx.new(|_| OpenSession::new(view, link));
+        self.open_sessions
+            .hub
+            .insert(key.clone(), session.downgrade());
+        let subscription = cx.subscribe(&session, |this, session, event: &OpenSessionEvent, cx| {
+            this.on_session_event(&session, event, cx)
+        });
+        self.open_sessions.subs.insert(key, subscription);
+        session
+    }
+
+    /// The session for `target`: the one that is already open, or a new one
+    /// loaded from the agent. The caller holds the returned handle for as long
+    /// as it shows the session.
+    #[must_use]
+    pub(crate) fn open(
+        &mut self,
+        target: SessionRef,
+        cx: &mut Context<Self>,
+    ) -> Entity<OpenSession> {
+        let SessionRef { key, cwd, title } = target;
+        if let Some(existing) = self.live_session(&key) {
+            // Shared, not loaded again, unless its last load failed.
+            if existing.read(cx).view.error.is_some() {
+                let link = self.link_for(key.agent.as_str());
+                existing.update(cx, |o, cx| {
+                    o.rebind(link, cx);
+                    o.reload(cx);
+                });
+            }
+            return existing;
+        }
+        let (agent_id, session_id) = (key.agent.as_str(), key.session.as_str());
+        self.remember_recent_session(agent_id, session_id);
+        let mut view = SessionView::new(agent_id, session_id, &cwd, &title);
+        // Before the load: a later load or update applies on top of them.
+        self.take_early_commands(&mut view);
+        if let Some(s) = self
+            .runtime
+            .get(agent_id)
+            .and_then(|rt| rt.sessions.iter().find(|s| s.id == session_id))
+        {
+            view.phase = s.phase.clone();
+        }
+        if self
+            .runtime
+            .get(agent_id)
+            .is_some_and(AgentRuntime::is_connected)
+        {
+            crate::telemetry::mark_session_open(session_id);
+        }
+        let session = self.adopt(view, cx);
+        session.update(cx, |o, cx| o.load(cx));
+        cx.notify();
+        session
+    }
+
+    /// What an open session tells the store: its turn ended, its load ended,
+    /// or the user stopped it.
+    fn on_session_event(
+        &mut self,
+        session: &Entity<OpenSession>,
+        event: &OpenSessionEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let key = session.read(cx).key.clone();
+        let (agent_id, session_id) = (key.agent.as_str(), key.session.as_str());
+        match event {
+            OpenSessionEvent::TurnFinished { error } => {
+                if let (Some(err), Some(rt)) = (error, self.runtime.get_mut(agent_id)) {
+                    rt.log_error(format!("Prompt failed: {err}"));
+                }
+                self.schedule_sessions_refresh(agent_id, Duration::from_millis(300), cx);
+            }
+            OpenSessionEvent::Loaded { skipped_mcp } => {
+                if let (Some(servers), Some(rt)) = (skipped_mcp, self.runtime.get_mut(agent_id)) {
+                    mcp_notice::record(rt, session_id, servers.clone(), false);
+                }
+                self.refresh_delegates(&key, cx);
+            }
+            OpenSessionEvent::Cancelled => self.cancel_session_requests(&key, cx),
+        }
+        cx.notify();
+    }
+
+    /// The model of `view`, with a node only when it is not the agent's own
+    /// machine.
+    pub fn session_model_key(&self, view: &SessionView) -> Option<String> {
+        let own = self
+            .runtime(&view.agent_id)
+            .and_then(|rt| rt.mesh.as_ref())
+            .and_then(|m| m.peer_id.as_deref());
+        let node = view.model_node.as_deref().filter(|n| Some(*n) != own);
+        Some(model_key(view.model.as_deref()?, node))
+    }
+
+    /// The model of `view` in its agent's catalog.
+    pub fn session_model(&self, view: &SessionView) -> Option<&Model> {
+        find_model(self.models(&view.agent_id), &self.session_model_key(view)?)
+    }
+
+    /// Revert the workspace of `session` to before the user turn `message_id`
+    /// (and every later turn), then reload the transcript.
+    pub fn undo_workspace_to(
+        &mut self,
+        session: &Entity<OpenSession>,
+        message_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let blocked = self.fork_pending_for(session.read(cx).key.agent.as_str());
+        session.update(cx, |o, cx| o.undo_to(message_id, blocked, cx));
     }
 
     /// Re-apply the most recently undone turn (`querymt/session/redo`).
-    pub fn redo_workspace(&mut self, cx: &mut Context<Self>) {
-        self.start_undo_op(None, cx);
+    pub fn redo_workspace(&mut self, session: &Entity<OpenSession>, cx: &mut Context<Self>) {
+        let blocked = self.fork_pending_for(session.read(cx).key.agent.as_str());
+        session.update(cx, |o, cx| o.redo(blocked, cx));
     }
 
-    /// `target`: undo to that turn; `None`: redo.
-    fn start_undo_op(&mut self, target: Option<String>, cx: &mut Context<Self>) {
-        let undo = target.is_some();
-        let supported = self.session_supports_undo();
-        let forking = self.fork_pending();
-        let Some(view) = self.session.as_mut() else {
-            return;
-        };
-        if view.loading || view.running() || view.undo_pending || forking {
-            return;
-        }
-        if !supported {
-            view.push_notice("This agent does not support workspace undo and redo.", true);
-            cx.notify();
-            return;
-        }
-        let (method, params) = if let Some(target) = target {
-            if view.undo_affected_turns(&target).is_none() {
-                return;
-            }
-            (
-                "_querymt/session/undo",
-                json!({ "session_id": view.session_id, "message_id": target }),
-            )
-        } else {
-            if view.undo_stack.is_empty() {
-                return;
-            }
-            (
-                "_querymt/session/redo",
-                json!({ "session_id": view.session_id }),
-            )
-        };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
-            return;
-        };
-        view.undo_pending = true;
-        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        cx.notify();
-        let req = rpc.request(method, params);
-        cx.spawn(async move |this, cx| {
-            let result = req.await;
-            let _ = this.update(cx, |s, cx| {
-                s.finish_undo_op(&agent_id, &session_id, undo, result, cx)
-            });
-        })
-        .detach();
-    }
-
-    fn finish_undo_op(
-        &mut self,
-        agent_id: &str,
-        session_id: &str,
-        undo: bool,
-        result: Result<Value, String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(view) = self
-            .session
-            .as_mut()
-            .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-        else {
-            return;
-        };
-        view.undo_pending = false;
-        let what = if undo { "Undo" } else { "Redo" };
-        let resp = match result {
-            Ok(resp) => resp,
-            Err(err) => {
-                view.push_notice(format!("{what} failed: {err}"), true);
-                cx.notify();
-                return;
-            }
-        };
-        view.undo_stack = UndoFrame::parse_stack(&resp);
-        if resp.get("success").and_then(Value::as_bool) != Some(true) {
-            let msg = resp
-                .get("message")
-                .and_then(Value::as_str)
-                .map_or_else(|| format!("{what} failed."), str::to_owned);
-            view.push_notice(msg, true);
-            cx.notify();
-            return;
-        }
-        let notice = if undo {
-            let n = resp
-                .get("reverted_files")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            match n {
-                0 => "Turn undone.".to_string(),
-                1 => "Undid 1 changed file.".to_string(),
-                n => format!("Undid {n} changed files."),
-            }
-        } else {
-            "Turn restored.".to_string()
-        };
-        // History changed: reload the transcript, then show the result.
-        self.reload_session(cx);
-        if let Some(view) = self.session.as_mut() {
-            view.after_load_notice = Some(notice);
-        }
-    }
-
-    pub fn reload_session(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.session.take() else {
-            return;
-        };
-        self.open_session(&view.agent_id, &view.session_id, &view.cwd, &view.title, cx);
-        if let Some(v) = self.session.as_mut() {
-            v.parent = view.parent;
-        }
-    }
-
-    /// Open delegated session `child` of the open session, remembering the
-    /// open one so Back returns to it. Uses the child's own title and
-    /// workspace when the session list knows them.
-    pub fn open_child_session(&mut self, agent_id: &str, child: &str, cx: &mut Context<Self>) {
-        let Some(current) = self.session.as_ref() else {
-            return;
-        };
-        let parent = ParentSession {
-            agent_id: current.agent_id.clone(),
-            session_id: current.session_id.clone(),
-            cwd: current.cwd.clone(),
-            title: current.title.clone(),
-            parent: current.parent.clone(),
-        };
-        let (cwd, title) = match self.session_summary(agent_id, child) {
-            Some(s) if !s.cwd.is_empty() => (s.cwd.clone(), s.title.clone()),
-            Some(s) => (parent.cwd.clone(), s.title.clone()),
-            None => (parent.cwd.clone(), String::new()),
-        };
-        self.open_session(agent_id, child, &cwd, &title, cx);
-        if let Some(v) = self
-            .session
-            .as_mut()
-            .filter(|v| v.agent_id == agent_id && v.session_id == child)
-        {
-            v.parent = Some(Box::new(parent));
-        }
-    }
-
-    /// Back from a delegated session: reopen its parent (keeping the chain).
-    /// Returns false when the open session has no parent.
-    pub fn open_parent_session(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(parent) = self.session.as_mut().and_then(|v| v.parent.take()) else {
-            return false;
-        };
-        let ParentSession {
-            agent_id,
-            session_id,
-            cwd,
-            title,
-            parent: grand,
-        } = *parent;
-        // Prefer the list's current title; the stored one may be stale.
-        let title = self
-            .session_summary(&agent_id, &session_id)
-            .map(|s| s.title.clone())
-            .filter(|t| !t.trim().is_empty())
-            .unwrap_or(title);
-        self.open_session(&agent_id, &session_id, &cwd, &title, cx);
-        if let Some(v) = self.session.as_mut() {
-            v.parent = grand;
-        }
-        true
-    }
-
-    /// Whether the open session's agent supports steering / queueing input.
-    pub fn session_can_control_run(&self) -> bool {
-        self.session
-            .as_ref()
-            .and_then(|v| self.runtime.get(&v.agent_id))
-            .is_some_and(AgentRuntime::can_control_run)
-    }
-
-    /// Send a prompt to the open session. While a turn runs on an agent with
-    /// turn control, `delivery` (`steer` / `queue`) picks the QueryMT extension.
+    /// Send a prompt to `session`. While a turn runs on an agent with turn
+    /// control, `delivery` (steer or queue) picks the QueryMT extension.
     pub fn send_prompt(
         &mut self,
+        session: &Entity<OpenSession>,
         text: String,
         attachments: Vec<Attachment>,
-        delivery: &str,
+        delivery: Delivery,
         cx: &mut Context<Self>,
     ) {
-        let control = self.session_can_control_run();
-        let Some(view) = self.session.as_mut() else {
-            return;
-        };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
-            view.push_notice("The agent is not connected.", true);
-            cx.notify();
-            return;
-        };
-        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let content = prompt_content(&text, &attachments, self.prefs.image_send_mode);
-        if view.running() && control {
-            // Like desktop: slash commands can't steer, they always queue.
-            let wanted: &'static str = if text.trim_start().starts_with('/') || delivery == "queue"
-            {
-                "queue"
-            } else {
-                "steer"
-            };
-            let input_id = format!("gpui-{}", now_ms() as u64);
-            // The message waits in the activity dock; the agent echoes it into
-            // the transcript once it is applied (steer) or started (queue).
-            view.add_pending_input(crate::session::PendingInput {
-                input_id: input_id.clone(),
-                delivery: wanted.into(),
-                state: "sending".into(),
-                text: text.clone(),
-                attachments: attachments.len(),
-                discard_pending: false,
-            });
-            let known_run = view.run_id.clone();
-            cx.notify();
-            cx.spawn(async move |this, cx| {
-                // Steering must name the active run (`expected_run_id`); ask the
-                // agent for it, falling back to the last one we saw.
-                let mut delivery = wanted;
-                let mut run_id = known_run;
-                if delivery == "steer" {
-                    let state = rpc.request("_querymt/session/runtimeState", json!({ "session_id": session_id })).await;
-                    if let Ok(rt) = &state {
-                        run_id = rt.get("active_run_id").and_then(Value::as_str).map(str::to_owned).or(run_id);
-                        let phase = rt.get("phase").and_then(Value::as_str).unwrap_or_default();
-                        let steerable = rt.get("steerable").and_then(Value::as_bool).unwrap_or(true);
-                        if !steerable || matches!(phase, "closing" | "cancel_requested") {
-                            run_id = None;
-                        }
-                        let _ = this.update(cx, |s, cx| {
-                            if let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) {
-                                view.apply_runtime(rt);
-                                view.sync_work(now_ms());
-                                cx.notify();
-                            }
-                        });
-                    }
-                    // No steerable run: queue instead, as desktop does.
-                    if run_id.is_none() {
-                        delivery = "queue";
-                    }
-                }
-                let mut params = json!({ "session_id": session_id, "prompt": content, "client_input_id": input_id });
-                if let ("steer", Some(run)) = (delivery, &run_id) {
-                    params["expected_run_id"] = json!(run);
-                }
-                let method = if delivery == "queue" { "_querymt/session/queue" } else { "_querymt/session/steer" };
-                let result = rpc.request(method, params).await;
-                let _ = this.update(cx, |s, cx| {
-                    let Some(view) = s.session.as_mut().filter(|v| v.agent_id == agent_id && v.session_id == session_id) else { return };
-                    match &result {
-                        Err(err) => {
-                            view.set_input_state(&input_id, delivery, "failed");
-                            view.push_notice(format!("Could not deliver the message: {err}"), true);
-                        }
-                        Ok(v) => {
-                            let status = v.get("status").and_then(Value::as_str).unwrap_or_default();
-                            let id = v.pointer("/data/input_id").and_then(Value::as_str).unwrap_or(&input_id).to_string();
-                            view.rekey_input(&input_id, &id);
-                            let state = match status {
-                                "steered" => "accepted",
-                                "queued" => "queued",
-                                // The session went idle meanwhile: it runs as a new turn.
-                                _ => "started",
-                            };
-                            let delivery = if status == "queued" { "queue" } else { delivery };
-                            view.set_input_state(&id, delivery, state);
-                            // A notification may have overtaken this response.
-                            if let Some((d, st)) = view.input_notes.remove(&id).or_else(|| view.input_notes.remove(&input_id)) {
-                                view.set_input_state(&id, &d, &st);
-                            }
-                            if status == "started" {
-                                view.phase = "starting".into();
-                                view.sync_work(now_ms());
-                            }
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
+        let image_mode = self.prefs.image_send_mode;
+        session.update(cx, |o, cx| {
+            o.send(text, attachments, delivery, image_mode, cx)
+        });
+    }
+
+    /// Change a config option of `session` (`session/set_config_option`);
+    /// an empty `config_id` means the mode of an agent that only has
+    /// `session/set_mode`. For `model`, `value` is a selection key
+    /// ([`model_key`]), so the model on the chosen machine is sent.
+    pub fn set_session_option(
+        &mut self,
+        session: &Entity<OpenSession>,
+        config_id: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_id = session.read(cx).key.agent.to_string();
+        if session.read(cx).link().rpc.is_none() {
             return;
         }
-        view.push_local_user(
-            &text,
-            attachments
-                .iter()
-                .map(Attachment::to_user_attachment)
-                .collect(),
-        );
-        view.prompting = true;
-        view.sync_work(crate::util::now_ms());
-        let turn = rpc.request(
-            "session/prompt",
-            json!({ "sessionId": session_id, "prompt": content }),
-        );
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = turn.await;
-            let _ = this.update(cx, |s, cx| {
-                s.finish_prompt(&agent_id, &session_id, result, cx)
-            });
-        })
-        .detach();
-    }
-
-    /// Remove a queued message before it starts (`querymt/session/discardQueuedInput`).
-    pub fn discard_queued_input(&mut self, input_id: &str, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_mut() else {
-            return;
-        };
-        let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) else {
-            return;
-        };
-        let Some(input) = view
-            .pending_inputs
-            .iter_mut()
-            .find(|i| i.input_id == input_id && i.state == "queued" && !i.discard_pending)
-        else {
-            return;
-        };
-        input.discard_pending = true;
-        let (agent_id, session_id, input_id) = (
-            view.agent_id.clone(),
-            view.session_id.clone(),
-            input_id.to_string(),
-        );
-        let req = rpc.request(
-            "_querymt/session/discardQueuedInput",
-            json!({ "session_id": session_id, "input_id": input_id }),
-        );
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = req.await;
-            let _ = this.update(cx, |s, cx| {
-                let Some(view) = s
-                    .session
-                    .as_mut()
-                    .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-                else {
-                    return;
-                };
-                match result {
-                    Ok(_) => view.set_input_state(&input_id, "queue", "discarded"),
-                    Err(err) => {
-                        if let Some(i) = view
-                            .pending_inputs
-                            .iter_mut()
-                            .find(|i| i.input_id == input_id)
-                        {
-                            i.discard_pending = false;
-                        }
-                        view.push_notice(
-                            format!("Could not remove the queued message: {err}"),
-                            true,
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Whether the open session's agent can remove queued messages.
-    pub fn can_discard_queued(&self) -> bool {
-        self.session
-            .as_ref()
-            .and_then(|v| self.runtime.get(&v.agent_id))
-            .is_some_and(|rt| rt.supports_method("querymt/session/discardQueuedInput"))
-    }
-
-    /// Change a session config option (`session/set_config_option`); an empty
-    /// `config_id` means the mode of an agent that only has `session/set_mode`.
-    /// Change a session config option; for `model`, `value` is a selection
-    /// key ([`model_key`]), so the model on the chosen machine is sent.
-    pub fn set_session_option(&mut self, config_id: &str, value: &str, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_mut() else {
-            return;
-        };
-        let Some(rt) = self.runtime.get(&view.agent_id) else {
-            return;
-        };
-        let Some(rpc) = rt.rpc.clone() else { return };
-        let (agent_id, session_id) = (view.agent_id.clone(), view.session_id.clone());
-        let key = if config_id.is_empty() {
-            "mode".to_string()
-        } else {
-            config_id.to_string()
-        };
-        // The model by selection key: its id goes on the wire, its catalog
-        // entry (with the node) in `_meta`.
         let model = (config_id == "model")
-            .then(|| find_model(&rt.models, value))
-            .flatten()
-            .cloned();
-        let wire = model.as_ref().map_or(value, |m| m.id.as_str()).to_string();
-        view.pending_options.insert(key.clone());
-        let req = if config_id.is_empty() {
-            rpc.request(
-                "session/set_mode",
-                json!({ "sessionId": session_id, "modeId": wire }),
-            )
-        } else {
-            let mut params =
-                json!({ "sessionId": session_id, "configId": config_id, "value": wire });
-            if let Some(model) = &model {
-                let mut entry = model.raw.clone();
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.remove("availability");
-                }
-                params["_meta"] = json!({ "querymt": { "modelEntry": entry } });
-            }
-            rpc.request("session/set_config_option", params)
-        };
-        let config_id = config_id.to_string();
+            .then(|| {
+                self.runtime
+                    .get(&agent_id)
+                    .and_then(|rt| find_model(&rt.models, value))
+                    .cloned()
+            })
+            .flatten();
         if let Some(model) = &model {
             self.remember_model(&agent_id, &model.key());
             self.save();
         }
-        let node = model.and_then(|m| m.node_id);
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = req.await;
-            let _ =
-                this.update(cx, |s, cx| {
-                    let Some(view) = s
-                        .session
-                        .as_mut()
-                        .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-                    else {
-                        return;
-                    };
-                    view.pending_options.remove(&key);
-                    match result {
-                        Ok(resp) => {
-                            if config_id.is_empty() {
-                                view.mode = Some(wire.clone());
-                            } else if resp.get("configOptions").is_some() {
-                                view.apply_config(resp.get("configOptions"));
-                                // A confirmation without the model entry names
-                                // the model but not its machine: keep the choice.
-                                if config_id == "model"
-                                    && !view.model_has_entry()
-                                    && view.model.as_deref() == Some(wire.as_str())
-                                {
-                                    view.model_node = node.clone();
-                                }
-                            } else {
-                                if let Some(o) = view.options.iter_mut().find(|o| {
-                                    o.get("id").and_then(Value::as_str) == Some(&config_id)
-                                }) {
-                                    o["currentValue"] = Value::String(wire.clone());
-                                }
-                                match config_id.as_str() {
-                                    "model" => {
-                                        view.model = Some(wire.clone());
-                                        view.model_node = node.clone();
-                                    }
-                                    "mode" => view.mode = Some(wire.clone()),
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Err(err) => view.push_notice(
-                            format!(
-                                "Could not change {}: {err}",
-                                if config_id.is_empty() {
-                                    "mode"
-                                } else {
-                                    &config_id
-                                }
-                            ),
-                            true,
-                        ),
-                    }
-                    cx.notify();
-                });
-        })
-        .detach();
+        session.update(cx, |o, cx| o.set_option(config_id, value, model, cx));
     }
 
     /// Resolve / archive flags (`_querymt/session/setLifecycle`), optimistically.
@@ -3918,23 +3425,15 @@ impl AgentsStore {
         .detach();
     }
 
-    /// `session/cancel` for the open session's running turn.
-    pub fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.session.as_ref() else {
-            return;
-        };
-        if let Some(rpc) = self.runtime.get(&view.agent_id).and_then(|r| r.rpc.clone()) {
-            rpc.notify("session/cancel", json!({ "sessionId": view.session_id }));
-        }
-        // Pending prompts of this session are moot now.
-        let (agent, sid) = (view.agent_id.clone(), view.session_id.clone());
+    /// Pending prompts of a stopped session are moot.
+    fn cancel_session_requests(&mut self, session: &SessionKey, cx: &mut Context<Self>) {
         let keys: Vec<(String, bool)> = self
             .requests
             .iter()
             .filter(|r| {
                 r.answerable()
-                    && r.agent_id == agent
-                    && r.session_id.as_deref() == Some(sid.as_str())
+                    && r.agent_id == session.agent.as_str()
+                    && r.session_id.as_deref() == Some(session.session.as_str())
             })
             .map(|r| (r.key.clone(), r.is_elicitation()))
             .collect();
@@ -3951,47 +3450,6 @@ impl AgentsStore {
                 );
             }
         }
-        cx.notify();
-    }
-
-    fn finish_prompt(
-        &mut self,
-        agent_id: &str,
-        session_id: &str,
-        result: Result<Value, String>,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(view) = self
-            .session
-            .as_mut()
-            .filter(|v| v.agent_id == agent_id && v.session_id == session_id)
-        {
-            view.prompting = false;
-            view.sync_work(crate::util::now_ms());
-            match &result {
-                Err(err) => view.push_notice(format!("Prompt failed: {err}"), true),
-                Ok(v) => match v.get("stopReason").and_then(Value::as_str) {
-                    Some("cancelled") => view.push_notice("Stopped.", false),
-                    Some("max_tokens") => {
-                        view.push_notice("Stopped: the model hit its token limit.", true)
-                    }
-                    Some("refusal") => view.push_notice("The model refused to continue.", true),
-                    _ => {}
-                },
-            }
-        }
-        if let (Err(err), Some(rt)) = (&result, self.runtime.get_mut(agent_id)) {
-            rt.log_error(format!("Prompt failed: {err}"));
-        }
-        // A finished turn adds an undo target and drops stale redo frames.
-        if self
-            .session
-            .as_ref()
-            .is_some_and(|v| v.agent_id == agent_id && v.session_id == session_id)
-        {
-            self.refresh_undo_stack(cx);
-        }
-        self.schedule_sessions_refresh(agent_id, Duration::from_millis(300), cx);
         cx.notify();
     }
 
@@ -4310,11 +3768,6 @@ impl AgentsStore {
             .find(|s| s.id == session_id)
     }
 
-    pub fn clear_launch_error(&mut self, cx: &mut Context<Self>) {
-        self.launch.error = None;
-        cx.notify();
-    }
-
     // ---- internals ----------------------------------------------------------
 
     /// Runtime of `id` if `generation` is still the current connection.
@@ -4335,6 +3788,7 @@ impl AgentsStore {
         rt.state = ConnState::Failed(reason);
         rt.busy = false;
         self.retire_requests(id);
+        self.rebind_sessions(id, false, cx);
         self.schedule_reconnect(id, generation, cx);
         cx.notify();
     }
@@ -4403,35 +3857,32 @@ impl AgentsStore {
                 }
             }
             Incoming::Notification { method, params } => {
+                // The open session an input is addressed to; inputs for a
+                // session no surface holds change no transcript.
+                let key = SessionKey::from_update(id, &params);
+                let target = key.as_ref().and_then(|k| self.live_session(k));
                 if method == "session/update" {
-                    let session_id = params
-                        .get("sessionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if let Some(view) = self
-                        .session
-                        .as_mut()
-                        .filter(|v| v.agent_id == id && v.session_id == session_id)
-                        && let Some(update) = params.get("update")
-                    {
-                        view.apply(update);
-                        cx.notify();
+                    match &target {
+                        Some(session) => session.update(cx, |o, cx| {
+                            o.view.queue_session_update(&params);
+                            o.schedule_flush(cx);
+                        }),
+                        // No surface holds it yet (e.g. `launch` before its
+                        // view exists): keep what it advertises.
+                        None => self.note_early_commands(id, &params),
                     }
                 }
-                if method.ends_with("session/delegationUpdate") {
-                    let sid = params
-                        .get("sessionId")
-                        .or_else(|| params.get("session_id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if let Some(view) = self
-                        .session
-                        .as_mut()
-                        .filter(|v| v.agent_id == id && v.session_id == sid)
-                    {
-                        view.apply_child_links(std::slice::from_ref(&params));
-                        cx.notify();
-                    }
+                // Run state of any run, including ones other clients started.
+                // Child links arrive as `subagent_update`s through the core.
+                if method
+                    .trim_start_matches('_')
+                    .ends_with("session/stateUpdate")
+                    && let Some(session) = &target
+                {
+                    session.update(cx, |o, cx| {
+                        o.view.queue_state_update(&params);
+                        o.schedule_flush(cx);
+                    });
                 }
                 if method.ends_with("session/runtimeChanged") {
                     let sid = params
@@ -4444,15 +3895,13 @@ impl AgentsStore {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    if let Some(view) = self
-                        .session
-                        .as_mut()
-                        .filter(|v| v.agent_id == id && v.session_id == sid)
-                    {
-                        if let Some(rt) = params.get("runtime") {
-                            view.apply_runtime(rt);
-                        }
-                        view.sync_work(crate::util::now_ms());
+                    if let Some(session) = &target {
+                        session.update(cx, |o, cx| {
+                            if let Some(rt) = params.get("runtime") {
+                                o.view.queue_runtime(rt);
+                            }
+                            o.schedule_flush(cx);
+                        });
                     }
                     if let Some(s) = self
                         .runtime
@@ -4463,40 +3912,32 @@ impl AgentsStore {
                     }
                     cx.notify();
                 }
-                if method.ends_with("session/inputState") {
-                    let sid = params
-                        .get("session_id")
+                if method.ends_with("session/inputState")
+                    && let Some(session) = &target
+                {
+                    let input_id = params
+                        .get("input_id")
                         .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if let Some(view) = self
-                        .session
-                        .as_mut()
-                        .filter(|v| v.agent_id == id && v.session_id == sid)
-                    {
-                        let input_id = params
-                            .get("input_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let delivery = params
-                            .get("delivery")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        let state = params
-                            .get("state")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                        if view.pending_inputs.iter().any(|i| i.input_id == input_id) {
-                            view.set_input_state(&input_id, &delivery, &state);
-                        } else {
-                            // Its submit response hasn't arrived yet (or the id
-                            // is still the client's); apply it when it does.
-                            view.input_notes.insert(input_id, (delivery, state));
-                        }
-                        cx.notify();
-                    }
+                        .unwrap_or_default()
+                        .to_string();
+                    let delivery = params
+                        .get("delivery")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let state = params
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    // The core lists the input for any client; an input
+                    // sent from here waits for its submit response to
+                    // learn its agent id, so an early state is kept.
+                    session.update(cx, |o, cx| {
+                        o.view.queue_input_state(&params);
+                        o.view.note_input_state(&input_id, &delivery, &state);
+                        o.schedule_flush(cx);
+                    });
                 }
                 if method
                     .trim_start_matches('_')
@@ -4505,6 +3946,10 @@ impl AgentsStore {
                 {
                     self.on_elicitation_notification(id, &method, &params);
                     cx.notify();
+                }
+                // Plans of listed sessions are patched in place; no re-list.
+                if method.trim_start_matches('_') == "querymt/session/plansChanged" {
+                    self.on_plans_changed(id, &params, cx);
                 }
                 if method.contains("runtimeChanged")
                     || method.contains("lifecycle")
@@ -4527,16 +3972,8 @@ impl AgentsStore {
                         self.refresh_schedules(id, cx);
                     }
                 } else if method.ends_with("session/delegateModelsChanged") {
-                    let sid = params
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if self
-                        .session
-                        .as_ref()
-                        .is_some_and(|v| v.agent_id == id && v.session_id == sid)
-                    {
-                        self.refresh_delegates(cx);
+                    if let Some(key) = key.as_ref().filter(|_| target.is_some()) {
+                        self.refresh_delegates(key, cx);
                     }
                 } else if method.contains("models/changed") || method.contains("nodesChanged") {
                     self.refresh(id, cx);
@@ -4817,6 +4254,8 @@ async fn load_details(
         Ok(caps) => rt.capabilities = Some(caps),
         Err(err) => rt.log_warn(format!("Capabilities unavailable: {err}")),
     });
+    // What the agent can do is known now: open sessions use it.
+    let _ = this.update(cx, |s, cx| s.rebind_sessions(&id, false, cx));
     if recovery {
         recover_elicitations(&this, &id, generation, &rpc, cx)
             .instrument(tracing::info_span!("agent.recover_elicitations"))
@@ -4900,7 +4339,7 @@ async fn load_details(
                 // pages are in flight (6.1s instead of 0.3s): let an open
                 // session load first.
                 while this
-                    .read_with(&cx2, |s, _| s.session.as_ref().is_some_and(|v| v.loading))
+                    .read_with(&cx2, |s, cx| s.any_session_loading(cx))
                     .unwrap_or(false)
                 {
                     cx2.background_executor()
@@ -5129,7 +4568,7 @@ fn percent_encode(s: &str) -> String {
 
 /// Copyable report for a failed `session/load`: what was asked, of whom, and
 /// the agent's raw JSON-RPC error (its `data` usually carries the real cause).
-fn load_error_report(
+pub(crate) fn load_error_report(
     agent: &str,
     params: &Value,
     err: &crate::rpc::RpcError,
@@ -5163,7 +4602,24 @@ fn load_error_report(
 
 /// ACP prompt blocks: text plus attachments. Images are native `image` blocks
 /// unless `image_mode` asks for resources; other files are always embedded resources.
-fn prompt_content(
+/// Serialized size of a value, counted without building the string.
+pub(crate) fn json_size(value: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
+pub(crate) fn prompt_content(
     prompt: &str,
     attachments: &[Attachment],
     image_mode: ImageSendMode,
@@ -5345,6 +4801,60 @@ mod tests {
         assert_eq!(ms, [250, 500, 1000, 2000, 4000, 8000, 8000, 8000]);
     }
 
+    /// An extension call answered after its connection was replaced changes
+    /// nothing: no error, no `then`, and the same action started on the new
+    /// connection stays pending.
+    #[gpui_kit::test]
+    fn ext_answer_from_an_old_connection_is_ignored(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let store = cx.new(|_| automations::schedule_ui_fixture());
+        let (old_rpc, old_requests) =
+            cx.update(|cx| store.update(cx, |s, _| s.rpc_for_test("test-agent")));
+        cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.create_invite("test-agent", "1h", None, None, cx)
+            })
+        });
+        cx.run_until_parked();
+        let old_invite: Value = serde_json::from_str(&old_requests.try_recv().unwrap()).unwrap();
+
+        // Reconnect: the old request fails as the old client closes, and the
+        // same action starts on the new connection before that failure lands.
+        let (rpc, requests) = cx.update(|cx| {
+            store.update(cx, |s, cx| {
+                s.disconnect("test-agent", cx);
+                let link = s.rpc_for_test("test-agent");
+                s.runtime_mut_for_test("test-agent").state = ConnState::Connected;
+                s.create_invite("test-agent", "1h", None, None, cx);
+                link
+            })
+        });
+        cx.run_until_parked();
+        // A late answer to the old request cannot reach the new client either.
+        old_rpc.handle(&json!({ "id": old_invite["id"], "result": { "url": "old" } }).to_string());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let rt = store.read(cx).runtime("test-agent").unwrap();
+            assert_eq!(rt.action_error, None, "the old failure is not reported");
+            assert!(
+                rt.pending.contains("invite"),
+                "the new call is still in flight"
+            );
+            assert_eq!(rt.last_invite, None);
+        });
+
+        // The current connection's answer applies as usual.
+        let invite: Value = serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
+        assert_eq!(invite["method"], "_querymt/mesh/createInvite");
+        rpc.handle(&json!({ "id": invite["id"], "result": { "url": "new" } }).to_string());
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let rt = store.read(cx).runtime("test-agent").unwrap();
+            assert!(!rt.pending.contains("invite"));
+            assert_eq!(rt.last_invite.as_deref(), Some("new"));
+        });
+    }
+
     #[test]
     fn applied_reasoning_level_reaches_the_new_session_options() {
         let option = |current: &str| {
@@ -5472,12 +4982,12 @@ mod tests {
             configs: Vec::new(),
             prefs: Prefs::default(),
             launch: Default::default(),
-            session: None,
+            open_sessions: Default::default(),
             requests: Vec::new(),
             runtime: HashMap::new(),
             sidebar: Default::default(),
+            early_commands: Default::default(),
             first_run: false,
-            _launch_task: None,
         };
         store.runtime.entry("a".into()).or_default().models = models.clone();
         store.remember_model("a", &remote.key());
@@ -5507,6 +5017,53 @@ mod tests {
         assert!(view.model_node.is_none());
         view.apply_config(Some(&option(None)));
         assert!(view.model_node.is_none());
+    }
+
+    #[test]
+    fn old_prefs_load_with_quick_defaults() {
+        // Saved before the quick panel existed.
+        let prefs: Prefs = serde_json::from_str(r#"{"dark":true,"primary_agent":"a"}"#).unwrap();
+        assert_eq!(prefs.quick, QuickPrefs::default());
+        assert!(!prefs.quick.enabled);
+        assert!(prefs.quick.shortcut.is_empty());
+        // Settings saved before the picker had layouts open in the list.
+        assert_eq!(prefs.quick.picker_layout, PickerLayout::List);
+        let before_layouts: Prefs = serde_json::from_str(
+            r#"{"dark":null,"primary_agent":null,"quick":{"enabled":true,"shortcut":"alt+KeyK"}}"#,
+        )
+        .unwrap();
+        assert_eq!(before_layouts.quick.picker_layout, PickerLayout::List);
+        // A saved choice survives a round trip.
+        let json = serde_json::to_string(&Prefs {
+            quick: QuickPrefs {
+                enabled: true,
+                shortcut: "alt+KeyK".into(),
+                picker_layout: PickerLayout::Grid,
+                positions: [(
+                    "display-1".to_string(),
+                    QuickPosition {
+                        left: 10,
+                        top: 20,
+                        bottom: 84,
+                    },
+                )]
+                .into(),
+            },
+            ..prefs
+        })
+        .unwrap();
+        assert!(json.contains(r#""picker_layout":"grid""#));
+        let back: Prefs = serde_json::from_str(&json).unwrap();
+        assert!(back.quick.enabled);
+        assert_eq!(back.quick.shortcut, "alt+KeyK");
+        assert_eq!(back.quick.picker_layout, PickerLayout::Grid);
+        // A place left on a display survives a restart.
+        assert_eq!(back.quick.positions["display-1"].bottom, 84);
+        // A partial `quick` object fills in the rest.
+        let partial: Prefs =
+            serde_json::from_str(r#"{"dark":null,"primary_agent":null,"quick":{"enabled":true}}"#)
+                .unwrap();
+        assert!(partial.quick.enabled && partial.quick.shortcut.is_empty());
     }
 
     #[test]
